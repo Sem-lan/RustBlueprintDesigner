@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rust Blueprint Designer</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ── HEADER ── -->
+  <header id="app-header">
+    <h1>🏗️ Rust Blueprint Designer</h1>
+
+    <div id="floor-controls">
+      <button id="btn-prev-floor" title="Previous floor">◀</button>
+      <span id="floor-display">Floor 1</span>
+      <button id="btn-next-floor" title="Next floor">▶</button>
+      <button id="btn-add-floor">＋ Floor</button>
+      <button id="btn-remove-floor">－ Floor</button>
+      <label class="toggle-label" title="Mark current floor as a half-floor (lower ceiling)">
+        <input type="checkbox" id="half-floor-toggle" />
+        Half Floor
+      </label>
+    </div>
+  </header>
+
+  <!-- ── MAIN LAYOUT ── -->
+  <div id="main-layout">
+
+    <!-- ── LEFT SIDEBAR ── -->
+    <aside id="left-sidebar">
+
+      <section class="panel" id="tools-panel">
+        <h3>Tools</h3>
+        <div class="btn-group vertical" id="tools-group">
+          <button class="tool-btn active" data-tool="square">⬜ Square</button>
+          <button class="tool-btn" data-tool="triangle">◢ Triangle</button>
+          <button class="tool-btn" data-tool="door">🚪 Door</button>
+          <button class="tool-btn" data-tool="tc">📦 TC</button>
+          <button class="tool-btn" data-tool="erase">✕ Erase</button>
+        </div>
+
+        <!-- Triangle sub-options -->
+        <div id="triangle-options" class="sub-options hidden">
+          <h4>Orientation</h4>
+          <div class="btn-group grid2">
+            <button class="orient-btn active" data-orient="ne" title="North-East">◢ NE</button>
+            <button class="orient-btn" data-orient="nw" title="North-West">◣ NW</button>
+            <button class="orient-btn" data-orient="sw" title="South-West">◤ SW</button>
+            <button class="orient-btn" data-orient="se" title="South-East">◥ SE</button>
+          </div>
+        </div>
+
+        <!-- Door sub-options -->
+        <div id="door-options" class="sub-options hidden">
+          <h4>Door Type</h4>
+          <div class="btn-group vertical">
+            <button class="dtype-btn active" data-dtype="single">Single Door</button>
+            <button class="dtype-btn" data-dtype="double">Double Door</button>
+            <button class="dtype-btn" data-dtype="garage">Garage Door</button>
+          </div>
+          <h4>Door Material</h4>
+          <div class="btn-group vertical">
+            <button class="dmat-btn active" data-dmat="sheet">Sheet Metal</button>
+            <button class="dmat-btn" data-dmat="armored">Armored</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3>Wall Material</h3>
+        <div class="btn-group vertical" id="material-group">
+          <button class="mat-btn wood"    data-mat="wood">🪵 Wood</button>
+          <button class="mat-btn stone active" data-mat="stone">🪨 Stone</button>
+          <button class="mat-btn metal"   data-mat="metal">⚙️ Metal</button>
+          <button class="mat-btn armored" data-mat="armored">🛡️ Armored</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3>Actions</h3>
+        <button class="action-btn" id="btn-clear-floor">🗑️ Clear Floor</button>
+        <button class="action-btn danger" id="btn-clear-all">💥 Clear All</button>
+      </section>
+
+    </aside>
+
+    <!-- ── CANVAS ── -->
+    <div id="canvas-wrap">
+      <canvas id="grid-canvas"></canvas>
+      <div id="canvas-hint">Left-click: place &nbsp;|&nbsp; Right-click: erase &nbsp;|&nbsp; Middle-drag / Alt-drag: pan &nbsp;|&nbsp; Scroll: zoom</div>
+    </div>
+
+    <!-- ── RIGHT SIDEBAR ── -->
+    <aside id="right-sidebar">
+
+      <section class="panel">
+        <h3>📊 Base Stats</h3>
+        <div class="stat-table">
+          <div class="stat-row"><span>Floors</span><span id="stat-floors">1</span></div>
+          <div class="stat-row"><span>Squares</span><span id="stat-squares">0</span></div>
+          <div class="stat-row"><span>Triangles</span><span id="stat-triangles">0</span></div>
+          <div class="stat-row"><span>Total Area</span><span id="stat-area">0</span></div>
+          <div class="stat-row"><span>Doors</span><span id="stat-doors">0</span></div>
+          <div class="stat-row"><span>TC Room</span><span id="stat-tc">—</span></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3>⚔️ Raid Calculator</h3>
+        <div id="raid-config">
+          <label>
+            <span>Base material</span>
+            <select id="raid-base-mat">
+              <option value="wood">Wood</option>
+              <option value="stone" selected>Stone</option>
+              <option value="metal">Sheet Metal</option>
+              <option value="armored">Armored</option>
+            </select>
+          </label>
+          <label>
+            <span>Default door</span>
+            <select id="raid-door-mat">
+              <option value="sheet" selected>Sheet Metal</option>
+              <option value="armored">Armored</option>
+              <option value="garage">Garage</option>
+            </select>
+          </label>
+        </div>
+        <button class="action-btn primary" id="btn-calc-raid">⚔️ Calculate</button>
+        <div id="raid-results">
+          <p class="hint">Place a TC then click Calculate</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3>💡 Help</h3>
+        <ul class="help-list">
+          <li>Select a tool, then click the grid to place</li>
+          <li>Drag to paint multiple cells</li>
+          <li>Door tool: click near a cell edge</li>
+          <li>TC tool: click any foundation cell</li>
+          <li>Right-click anywhere to erase</li>
+          <li>Add floors with the header controls</li>
+          <li>Half Floor = lowered ceiling on that level</li>
+        </ul>
+      </section>
+
+    </aside>
+  </div><!-- #main-layout -->
+
+  <script src="js/app.js"></script>
+</body>
+</html>
