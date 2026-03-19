@@ -1,0 +1,287 @@
+/* ─── RESET & ROOT ─────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:        #0d1117;
+  --bg-panel:  #161b22;
+  --bg-card:   #21262d;
+  --border:    #30363d;
+  --text:      #e6edf3;
+  --muted:     #8b949e;
+  --accent:    #f0a500;
+  --accent2:   #d4941f;
+  --danger:    #f85149;
+  --success:   #3fb950;
+
+  --wood:      #7a5c1e;
+  --stone:     #5a6268;
+  --metal:     #3a7a9c;
+  --armored:   #2a4a5e;
+
+  --sidebar-w: 195px;
+}
+
+body {
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* ─── HEADER ─────────────────────────────────────────────────────────── */
+#app-header {
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  padding: 6px 14px;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-shrink: 0;
+  height: 42px;
+}
+
+#app-header h1 {
+  font-size: 1rem;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+#floor-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+#floor-display {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  padding: 3px 12px;
+  border-radius: 4px;
+  font-weight: 700;
+  min-width: 72px;
+  text-align: center;
+  font-size: 0.85rem;
+}
+
+/* ─── LAYOUT ─────────────────────────────────────────────────────────── */
+#main-layout {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+#left-sidebar, #right-sidebar {
+  width: var(--sidebar-w);
+  background: var(--bg-panel);
+  overflow-y: auto;
+  flex-shrink: 0;
+  padding: 8px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#left-sidebar  { border-right: 1px solid var(--border); }
+#right-sidebar { border-left:  1px solid var(--border); }
+
+/* ─── PANELS ─────────────────────────────────────────────────────────── */
+.panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 9px;
+}
+
+.panel h3 {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted);
+  margin-bottom: 7px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--border);
+}
+
+.panel h4 {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin: 8px 0 4px;
+}
+
+.sub-options { margin-top: 10px; }
+.hidden      { display: none !important; }
+
+/* ─── BUTTONS ────────────────────────────────────────────────────────── */
+button {
+  background: var(--bg-panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 5px 9px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  transition: background .12s, border-color .12s;
+  white-space: nowrap;
+}
+
+button:hover  { background: var(--border); border-color: var(--muted); }
+button.active { background: var(--accent); color: #000; border-color: var(--accent2); font-weight: 700; }
+
+.btn-group         { display: flex; gap: 4px; }
+.btn-group.vertical{ flex-direction: column; }
+.btn-group.grid2   { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+
+.tool-btn, .mat-btn, .dtype-btn, .dmat-btn, .orient-btn {
+  text-align: left;
+  padding: 6px 9px;
+  width: 100%;
+}
+
+/* material accent strips */
+.mat-btn.wood    { border-left: 3px solid var(--wood);    }
+.mat-btn.stone   { border-left: 3px solid var(--stone);   }
+.mat-btn.metal   { border-left: 3px solid var(--metal);   }
+.mat-btn.armored { border-left: 3px solid var(--armored); }
+
+.action-btn         { width: 100%; margin-top: 5px; padding: 7px; }
+.action-btn.primary { background: var(--accent); color: #000; border-color: var(--accent2); font-weight: 700; }
+.action-btn.primary:hover { background: var(--accent2); }
+.action-btn.danger  { border-color: var(--danger); }
+.action-btn.danger:hover { background: var(--danger); }
+
+.toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+/* ─── CANVAS ─────────────────────────────────────────────────────────── */
+#canvas-wrap {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  background: #080c11;
+}
+
+#grid-canvas {
+  display: block;
+  cursor: crosshair;
+}
+
+#canvas-hint {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--muted);
+  font-size: 0.72rem;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* ─── STATS ──────────────────────────────────────────────────────────── */
+.stat-table { display: flex; flex-direction: column; gap: 1px; }
+
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.79rem;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+}
+.stat-row:last-child { border-bottom: none; }
+.stat-row span:last-child { font-weight: 700; color: var(--accent); }
+
+/* ─── RAID PANEL ─────────────────────────────────────────────────────── */
+#raid-config {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+#raid-config label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+#raid-config select {
+  background: var(--bg-panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 0.82rem;
+}
+
+#raid-results {
+  margin-top: 8px;
+  background: var(--bg);
+  border-radius: 4px;
+  padding: 8px;
+  font-size: 0.8rem;
+}
+
+.hint { color: var(--muted); font-style: italic; text-align: center; }
+
+.raid-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+}
+.raid-row:last-of-type { border-bottom: none; }
+.raid-row strong { color: var(--accent); }
+
+.raid-total {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--accent);
+  font-weight: 700;
+  color: var(--accent);
+  display: flex;
+  justify-content: space-between;
+}
+
+.raid-path {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.75rem;
+  word-break: break-all;
+}
+
+/* ─── HELP ───────────────────────────────────────────────────────────── */
+.help-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.help-list li {
+  font-size: 0.76rem;
+  color: var(--muted);
+  padding-left: 12px;
+  position: relative;
+}
+
+.help-list li::before {
+  content: '▸';
+  position: absolute;
+  left: 0;
+  color: var(--accent);
+}
