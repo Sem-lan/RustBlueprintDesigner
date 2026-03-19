@@ -59,7 +59,8 @@ var RAID_COSTS = {
  *   isHalfFloor : boolean (flag for the whole floor)
  *
  * cell.type values:
- *   "square" | "tri-ne" | "tri-nw" | "tri-sw" | "tri-se"
+ *   "square" | "tri-n" | "tri-e" | "tri-s" | "tri-w"
+ *   (tri-n = apex points north / base along south edge, etc.)
  *
  * door types  : "single" | "double" | "garage"
  * door materials: "sheet" | "armored"
@@ -72,7 +73,7 @@ var state = {
 
   tool:        'square',
   material:    'stone',
-  orientation: 'ne',           // triangle orientation
+  orientation: 'n',            // triangle orientation: 'n'=apex north, 'e'=apex east, 's'=apex south, 'w'=apex west
   doorType:    'single',
   doorMaterial:'sheet',
 
@@ -145,6 +146,19 @@ function neighbour(cx, cy, dir) {
   if (dir === 'w') return { x: cx-1, y: cy   };
   if (dir === 'e') return { x: cx+1, y: cy   };
   return null;
+}
+
+/*
+ * Returns the axis-aligned edge directions that belong to a cell type.
+ * Squares have all four edges.  Equilateral triangles have one base edge
+ * (the full-width/height side) that aligns with the grid.
+ */
+function cellBaseEdges(type) {
+  if (type === 'tri-n') return ['s'];   // base along south edge
+  if (type === 'tri-e') return ['w'];   // base along west edge
+  if (type === 'tri-s') return ['n'];   // base along north edge
+  if (type === 'tri-w') return ['e'];   // base along east edge
+  return ['n', 'e', 's', 'w'];         // square
 }
 
 /* ── GRID OPERATIONS ──────────────────────────────────────────────────────── */
@@ -363,27 +377,29 @@ function drawCell(x, y, cell, isHalf) {
 }
 
 function drawTriangleCell(ctx, bx, by, cs, type, mat) {
+  /* Height of an equilateral triangle whose side equals cs */
+  var h = cs * Math.sqrt(3) / 2;
   ctx.beginPath();
   switch (type) {
-    case 'tri-ne':
-      ctx.moveTo(bx,      by);
-      ctx.lineTo(bx + cs, by);
-      ctx.lineTo(bx + cs, by + cs);
+    case 'tri-n': /* apex points north, base along south edge */
+      ctx.moveTo(bx,        by + cs);
+      ctx.lineTo(bx + cs,   by + cs);
+      ctx.lineTo(bx + cs/2, by + cs - h);
       break;
-    case 'tri-nw':
-      ctx.moveTo(bx,      by);
-      ctx.lineTo(bx + cs, by);
-      ctx.lineTo(bx,      by + cs);
+    case 'tri-e': /* apex points east, base along west edge */
+      ctx.moveTo(bx,     by);
+      ctx.lineTo(bx,     by + cs);
+      ctx.lineTo(bx + h, by + cs/2);
       break;
-    case 'tri-sw':
-      ctx.moveTo(bx,      by);
-      ctx.lineTo(bx,      by + cs);
-      ctx.lineTo(bx + cs, by + cs);
+    case 'tri-s': /* apex points south, base along north edge */
+      ctx.moveTo(bx,        by);
+      ctx.lineTo(bx + cs,   by);
+      ctx.lineTo(bx + cs/2, by + h);
       break;
-    case 'tri-se':
-      ctx.moveTo(bx + cs, by);
-      ctx.lineTo(bx + cs, by + cs);
-      ctx.lineTo(bx,      by + cs);
+    case 'tri-w': /* apex points west, base along east edge */
+      ctx.moveTo(bx + cs,     by);
+      ctx.lineTo(bx + cs,     by + cs);
+      ctx.lineTo(bx + cs - h, by + cs/2);
       break;
   }
   ctx.closePath();
@@ -404,7 +420,7 @@ function drawWalls() {
     var cy = parseInt(parts[1], 10);
     var cell = fl.cells[k];
 
-    ['n', 'e', 's', 'w'].forEach(function(dir) {
+    cellBaseEdges(cell.type).forEach(function(dir) {
       var wk = wallKey(cx, cy, dir);
       if (drawn[wk]) return;
       drawn[wk] = true;
@@ -810,7 +826,7 @@ function updateStats() {
   document.getElementById('stat-floors').textContent    = state.floors.length;
   document.getElementById('stat-squares').textContent   = squares;
   document.getElementById('stat-triangles').textContent = triangles;
-  document.getElementById('stat-area').textContent      = (squares + triangles * 0.5).toFixed(1);
+  document.getElementById('stat-area').textContent      = (squares + triangles * 0.5).toFixed(1); // triangles count as ½ foundation each
   document.getElementById('stat-doors').textContent     = doors;
   document.getElementById('stat-tc').textContent        =
     state.tcCell
@@ -879,7 +895,7 @@ function doRaidCalc() {
     var cx    = parseInt(parts[0], 10);
     var cy    = parseInt(parts[1], 10);
 
-    ['n', 'e', 's', 'w'].forEach(function(dir) {
+    cellBaseEdges(cells[k].type).forEach(function(dir) {
       var nb   = neighbour(cx, cy, dir);
       var nbk  = cellKey(nb.x, nb.y);
       var cost = edgeCost(cx, cy, dir);
