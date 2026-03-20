@@ -41,15 +41,9 @@
           <button class="tool-btn" data-tool="erase">✕ Erase</button>
         </div>
 
-        <!-- Triangle sub-options -->
+        <!-- Triangle orientation is now automatic via edge snapping -->
         <div id="triangle-options" class="sub-options hidden">
-          <h4>Orientation</h4>
-          <div class="btn-group grid2">
-            <button class="orient-btn active" data-orient="n" title="Apex North (base along south)">▲ N</button>
-            <button class="orient-btn" data-orient="e" title="Apex East (base along west)">▶ E</button>
-            <button class="orient-btn" data-orient="s" title="Apex South (base along north)">▼ S</button>
-            <button class="orient-btn" data-orient="w" title="Apex West (base along east)">◀ W</button>
-          </div>
+          <p class="hint" style="font-size:0.72rem;">Rotation is automatic — snap to existing edges</p>
         </div>
 
         <!-- Door sub-options -->
@@ -137,13 +131,15 @@
       <section class="panel">
         <h3>💡 Help</h3>
         <ul class="help-list">
-          <li>Select a tool, then click the grid to place</li>
-          <li>Drag to paint multiple cells</li>
-          <li>Door tool: click near a cell edge</li>
-          <li>TC tool: click any foundation cell</li>
-          <li>Right-click anywhere to erase</li>
-          <li>Add floors with the header controls</li>
-          <li>Half Floor = lowered ceiling on that level</li>
+          <li>Click empty space to place your first piece</li>
+          <li>Hover near an edge to see snap preview</li>
+          <li>Triangles auto-rotate to align with edges</li>
+          <li>6 triangles around a point = hexagon!</li>
+          <li>Door tool: click near a piece edge</li>
+          <li>TC tool: click any foundation piece</li>
+          <li>Right-click to erase pieces/doors</li>
+          <li>Middle-drag or Alt+drag to pan</li>
+          <li>Scroll to zoom</li>
         </ul>
       </section>
 

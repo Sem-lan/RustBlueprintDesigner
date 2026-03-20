@@ -1,0 +1,1879 @@
+/* ==========================================================================
+   Rust Blueprint Designer — app.js
+   All logic in one file, plain ES5-compatible vanilla JS.
+   ========================================================================== */
+
+'use strict';
+
+/* ── CONSTANTS ────────────────────────────────────────────────────────────── */
+
+var CELL_SIZE   = 64;   // px at zoom=1
+var MIN_ZOOM    = 0.25;
+var MAX_ZOOM    = 4;
+var WALL_THRESH = 0.18; // fraction of cell size used as wall-click detection band
+
+var MATERIALS = {
+  wood:    { fill: '#6b4c1a', stroke: '#4a3310', name: 'Wood'        },
+  stone:   { fill: '#4d5359', stroke: '#363c41', name: 'Stone'       },
+  metal:   { fill: '#2d6b8a', stroke: '#1e4d65', name: 'Sheet Metal' },
+  armored: { fill: '#223d50', stroke: '#162835', name: 'Armored'     }
+};
+
+var DOOR_COLORS = {
+  sheet:   '#78afc7',
+  armored: '#8090a0',
+  garage:  '#c09030'
+};
+
+/*
+ * Raid costs in rockets (primary unit).
+ * Source: approximate real-game values, widely cited in community guides.
+ *   Wall  : wood=2  stone=4  metal=8  armored=15
+ *   Door  : sheet=1 armored=3 garage=2  (single/double treated the same; garage a bit cheaper)
+ * Satchel conversions: wood≈3 stone≈10 metal≈23 armored≈46
+ * C4 conversions:      wall×0.5 rounded up (C4 does ~550 dmg each)
+ */
+var RAID_COSTS = {
+  wall: {
+    wood:    { rockets: 2,  satchels: 3,  c4: 1  },
+    stone:   { rockets: 4,  satchels: 10, c4: 2  },
+    metal:   { rockets: 8,  satchels: 23, c4: 4  },
+    armored: { rockets: 15, satchels: 46, c4: 8  }
+  },
+  door: {
+    sheet:   { rockets: 1,  satchels: 4,  c4: 1  },
+    armored: { rockets: 3,  satchels: 12, c4: 2  },
+    garage:  { rockets: 2,  satchels: 9,  c4: 1  }
+  }
+};
+
+/* ── STATE ────────────────────────────────────────────────────────────────── */
+
+/*
+ * Data model for one floor:
+ *   cells : { "x,y" : { type, material, halfFloor } }
+ *   walls : { wallKey : { doorType, doorMaterial } }
+ *     wallKey format:
+ *       horizontal wall above row r at column c : "h|c|r"
+ *       vertical wall left of column c at row r : "v|c|r"
+ *   isHalfFloor : boolean (flag for the whole floor)
+ *
+ * cell.type values:
+ *   "square" | "tri-n" | "tri-e" | "tri-s" | "tri-w"
+ *   (tri-n = apex points north / base along south edge, etc.)
+ *
+ * door types  : "single" | "double" | "garage"
+ * door materials: "sheet" | "armored"
+ */
+
+var state = {
+  floors:      [ makeFloor() ],
+  currentFloor: 0,
+  tcCell:      null,           // { floor, x, y }
+
+  tool:        'square',
+  material:    'stone',
+  orientation: 'n',            // triangle orientation: 'n'=apex north, 'e'=apex east, 's'=apex south, 'w'=apex west
+  doorType:    'single',
+  doorMaterial:'sheet',
+
+  zoom: 1,
+  panX: 0,
+  panY: 0,
+
+  /* drag / pan state */
+  _drag:   false,
+  _erase:  false,
+  _pan:    false,
+  _panAnchorX: 0,
+  _panAnchorY: 0,
+
+  /* hover wall highlight */
+  _hoverWall: null,   // { x, y, dir, isDiag, wallKey, ... }
+  _snapPreview: null  // { x, y, type } — ghost preview for triangle snapping
+};
+
+function makeFloor() {
+  return { cells: {}, walls: {}, isHalfFloor: false };
+}
+
+/* ── TRIANGLE GRID SYSTEM ─────────────────────────────────────────────────────
+ *
+ * Triangle grids in Rust: two right-isosceles triangles share one square cell.
+ * A "triangle grid" tracks a set of triangles that all share the same diagonal
+ * axis.  Each floor tracks an array of triangle grids; when a new triangle is
+ * placed it either joins an existing grid (if a neighbour triangle's diagonal
+ * aligns) or starts a new one.
+ *
+ * For placement/snapping we derive adjacency from each triangle edge:
+ *
+ *   tri-n  (apex north, base south):
+ *     base edge  → south   → square / tri-s neighbour at (cx, cy+1)  OR  tri-n in same cell flip
+ *     diag-left  → nw-diag → 'tri-e' at (cx-1, cy)  [shares the bottom-left corner]
+ *     diag-right → ne-diag → 'tri-w' at (cx+1, cy)  [shares the bottom-right corner]
+ *     ALSO the cell (cx,cy) can hold the complementary tri-s (apex south)
+ *
+ *  In Rust, one CELL_SIZE × CELL_SIZE square can be divided diagonally into:
+ *    tri-n + tri-s  (NW–SE diagonal split: top triangle and bottom triangle)
+ *    tri-e + tri-w  (NE–SW diagonal split: right triangle and left triangle)
+ *
+ *  Here we keep triangles in separate cells to avoid collisions, so each cell
+ *  holds exactly one foundation piece.  The diagonal snapping means:
+ *
+ *  tri-n at (cx,cy): right-diag neighbours → tri-e at (cx,cy-1) and tri-w at (cx, cy-1)
+ *                    left-diag neighbours  → ... (see diagNeighbours below)
+ *
+ * Because the existing cell model already stores one piece per (x,y) key we
+ * keep that model and define diagonal adjacency purely for snapping purposes.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/*
+ * Diagonal edge wall key for triangles.
+ * Each triangle has 2 diagonal edges in addition to its 1 base edge.
+ * We encode them as "td|cx|cy|L" and "td|cx|cy|R" (left and right diagonal
+ * relative to the apex direction).
+ *
+ * Diagonal edges are SHARED between two adjacent triangles that are mirror
+ * images of each other.  The canonical key is always from the cell with the
+ * smaller key string (so we always get the same key from either side).
+ */
+function triDiagKey(cx, cy, side) {
+  return 'td|' + cx + '|' + cy + '|' + side;
+}
+
+/*
+ * Returns the canonical wall key for a diagonal edge between two triangle cells.
+ * Always uses the lexicographically-smaller cell key as the owner.
+ */
+function diagEdgeKey(cx1, cy1, cx2, cy2) {
+  var k1 = cellKey(cx1, cy1);
+  var k2 = cellKey(cx2, cy2);
+  if (k1 <= k2) {
+    return 'tde|' + cx1 + '|' + cy1 + '|' + cx2 + '|' + cy2;
+  } else {
+    return 'tde|' + cx2 + '|' + cy2 + '|' + cx1 + '|' + cy1;
+  }
+}
+
+/*
+ * For a given triangle type, return its three edge descriptors:
+ *   { type: 'base'|'diagL'|'diagR', wallKey(cx,cy), neighbour: {x,y,type} }
+ *
+ * Diagonal neighbours follow Rust's tessellation rules:
+ *   tri-n at (cx,cy):
+ *     diagL → tri-e at (cx-1, cy) [the east-pointing tri shares the top-left area]
+ *     diagR → tri-w at (cx+1, cy) [the west-pointing tri shares the top-right area]
+ *     OR alternatively they can be complementary tris in same cell / adjacent
+ *
+ *  The precise neighbour types depend on which grid alignment is active.
+ *  We use the simplest consistent tessellation:
+ *
+ *   tri-n: base=S → tri-s at (cx, cy+1) recommended; diagL=to tri-e at(cx-1,cy); diagR=to tri-w at(cx+1,cy)
+ *   tri-s: base=N → tri-n at (cx, cy-1); diagL=to tri-w at(cx-1,cy); diagR=to tri-e at(cx+1,cy)
+ *   tri-e: base=W → tri-w at (cx-1, cy); diagL=to tri-n at(cx, cy+1); diagR=to tri-s at(cx, cy-1) [wait - need to think ab this]
+ *   tri-w: base=E → tri-e at (cx+1, cy); diagL=to tri-s at(cx, cy+1); diagR=to tri-n at(cx, cy-1) [wait]
+ *
+ *  Actually let me use the 4-quadrant model: within a single cell, a "slash" (/)
+ *  or "backslash" (\) diagonal splits the cell into two.
+ *
+ *  '\' diagonal (backslash): top-left ↔ bottom-right = tri-n and tri-s complement in SAME cell
+ *  '/' diagonal (slash):     top-right ↔ bottom-left = tri-e and tri-w complement in SAME cell
+ *
+ *  But since we keep each piece in its own cell, diagonal adjacency between
+ *  different cells is:
+ *
+ *   tri-n at (cx,cy) — the geometry sits in lower-centre of the cell box:
+ *     Its two slant edges go from the apex (cx+0.5, cy_top) to the base corners.
+ *     For a right-isosceles halving of the cell:
+ *       apex at (cx+0.5, cy), base-corners at (cx, cy+1) and (cx+1, cy+1)
+ *     Slant-left goes from (cx+0.5, cy) to (cx, cy+1).
+ *       The triangle sharing this edge is a tri-e at (cx-1, cy) with its
+ *       rightmost point at (cx, cy+0.5). Hmm that doesn't match perfectly...
+ *
+ *  Let's use the simpler NON-equilateral model already in the code: the triangles
+ *  ARE right-isosceles: apex at cell midpoint of one edge, base on the opposite edge.
+ *  This means:
+ *   tri-n: apex at (cx+0.5, cy+0 + (cs - h)/1) = (cx+0.5, cy + cs - h)  where h=cs*sqrt(3)/2
+ *          base from (cx, cy+cs) to (cx+cs, cy+cs)
+ *  Wait, the code actually draws:
+ *   tri-n: (cx, cy+cs) → (cx+cs, cy+cs) → (cx+cs/2, cy+cs-h)
+ *  where h = cs * sqrt(3) / 2  (equilateral height)
+ *  The apex is at (cx+cs/2, cy+cs-h) = (cx+0.5*cs, cy + cs*(1-sqrt(3)/2))
+ *  ≈ (cx+0.5*cs, cy + 0.134*cs)  — near the top of the cell.
+ *
+ *  For the tessellation to work geometrically, let's accept that the diagonal
+ *  edges of these equilateral-style triangles don't align perfectly with other
+ *  triangles in different cells on the standard grid. Instead we use the common
+ *  Rust convention:
+ *
+ *  A square can be replaced by 2 triangles that share a DIAGONAL of the square.
+ *  The two triangles are:
+ *    BACKSLASH (\) cut: top-left half (tri-TL) + bottom-right half (tri-BR)
+ *    SLASH     (/) cut: top-right half (tri-TR) + bottom-left half (tri-BL)
+ *
+ *  In our cardinal naming:
+ *    '\' cut: tri-w (apex west = left half) + tri-e (apex east = right half)
+ *             These two occupy the SAME cell in the pair-in-cell model.
+ *    '/' cut: tri-n (apex north = top half) + tri-s (apex south = bottom half)
+ *             These two also occupy the SAME cell in the pair-in-cell model.
+ *
+ *  For cross-cell adjacency:
+ *   When you place a tri-n at (cx,cy), its two diagonal sides face:
+ *     - toward (cx-1, cy): the matching shape is tri-s at (cx-1, cy+1)? No...
+ *
+ *  SIMPLEST PRACTICAL MODEL (what Rust actually uses):
+ *  ─────────────────────────────────────────────────
+ *  Each triangle has 3 sides.  The "base" is one full cell-edge.
+ *  The two "slant" edges each are half the cell edge in projected length.
+ *  The neighbours on the slant sides are ALWAYS the same triangle type mirrored,
+ *  located diagonally:
+ *
+ *   tri-n at (cx,cy):
+ *     base (south) → same as square south → cell (cx, cy+1)
+ *     slant-left   → diagonal NW → cell (cx-1, cy-1) with type tri-s  [mirror]
+ *     slant-right  → diagonal NE → cell (cx+1, cy-1) with type tri-s  [mirror]
+ *
+ *   tri-s at (cx,cy):
+ *     base (north)  → cell (cx, cy-1)
+ *     slant-left    → diagonal SW → cell (cx-1, cy+1) with type tri-n
+ *     slant-right   → diagonal SE → cell (cx+1, cy+1) with type tri-n
+ *
+ *   tri-e at (cx,cy):
+ *     base (west)  → cell (cx-1, cy)
+ *     slant-top    → diagonal NE → cell (cx+1, cy-1) with type tri-w
+ *     slant-bottom → diagonal SE → cell (cx+1, cy+1) with type tri-w
+ *
+ *   tri-w at (cx,cy):
+ *     base (east)   → cell (cx+1, cy)
+ *     slant-top     → diagonal NW → cell (cx-1, cy-1) with type tri-e
+ *     slant-bottom  → diagonal SW → cell (cx-1, cy+1) with type tri-e
+ *
+ *  This is the model used for Rust blueprint tools online and matches how the
+ *  game tessellates triangle foundations.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/*
+ * Returns the 2 diagonal neighbours for a triangle of the given type at (cx,cy).
+ * Each entry: { nx, ny, ntype, edgeName: 'diagL'|'diagR' }
+ *
+ * In Rust's triangular grid, slant edges are shared between tiles in the SAME row/column:
+ *   tri-n (apex N, base S) at (cx,cy):
+ *     diagL → tri-s at (cx-1, cy)  [left  slant shared]
+ *     diagR → tri-s at (cx+1, cy)  [right slant shared]
+ *   tri-s (apex S, base N) at (cx,cy):
+ *     diagL → tri-n at (cx-1, cy)  [left  slant shared]
+ *     diagR → tri-n at (cx+1, cy)  [right slant shared]
+ *   tri-e (apex E, base W) at (cx,cy):
+ *     diagL → tri-w at (cx, cy-1)  [top   slant shared]
+ *     diagR → tri-w at (cx, cy+1)  [bottom slant shared]
+ *   tri-w (apex W, base E) at (cx,cy):
+ *     diagL → tri-e at (cx, cy-1)  [top   slant shared]
+ *     diagR → tri-e at (cx, cy+1)  [bottom slant shared]
+ */
+function triDiagNeighbours(type, cx, cy) {
+  if (type === 'tri-n') return [
+    { nx: cx-1, ny: cy, ntype: 'tri-s', edgeName: 'diagL' },
+    { nx: cx+1, ny: cy, ntype: 'tri-s', edgeName: 'diagR' }
+  ];
+  if (type === 'tri-s') return [
+    { nx: cx-1, ny: cy, ntype: 'tri-n', edgeName: 'diagL' },
+    { nx: cx+1, ny: cy, ntype: 'tri-n', edgeName: 'diagR' }
+  ];
+  if (type === 'tri-e') return [
+    { nx: cx, ny: cy-1, ntype: 'tri-w', edgeName: 'diagL' },
+    { nx: cx, ny: cy+1, ntype: 'tri-w', edgeName: 'diagR' }
+  ];
+  if (type === 'tri-w') return [
+    { nx: cx, ny: cy-1, ntype: 'tri-e', edgeName: 'diagL' },
+    { nx: cx, ny: cy+1, ntype: 'tri-e', edgeName: 'diagR' }
+  ];
+  return [];
+}
+
+/*
+ * Returns ALL edges for a triangle (base + 2 diagonals).
+ * Each entry: { edgeName, wallKeyFn(cx,cy), neighbourFn(cx,cy) }
+ * wallKeyFn returns the wall key string; neighbourFn returns {x,y} of neighbour cell.
+ */
+function triAllEdges(type, cx, cy) {
+  var diags = triDiagNeighbours(type, cx, cy);
+  var baseDir;
+  if (type === 'tri-n') baseDir = 's';
+  else if (type === 'tri-e') baseDir = 'w';
+  else if (type === 'tri-s') baseDir = 'n';
+  else if (type === 'tri-w') baseDir = 'e';
+
+  return [
+    { edgeName: 'base', wallKey: wallKey(cx, cy, baseDir), neighbour: neighbour(cx, cy, baseDir) },
+    { edgeName: 'diagL', wallKey: diagEdgeKey(cx, cy, diags[0].nx, diags[0].ny), neighbour: { x: diags[0].nx, y: diags[0].ny } },
+    { edgeName: 'diagR', wallKey: diagEdgeKey(cx, cy, diags[1].nx, diags[1].ny), neighbour: { x: diags[1].nx, y: diags[1].ny } }
+  ];
+}
+
+/* ── WALL KEY HELPERS ─────────────────────────────────────────────────────── */
+
+/*
+ * Each wall segment has a unique canonical key:
+ *   Horizontal wall between row (r-1) and row r at column c  →  "h|c|r"
+ *   Vertical wall between col (c-1) and col c at row r       →  "v|c|r"
+ *
+ * From a cell (cx, cy) and direction:
+ *   north → horizontal wall above row cy  → "h|cx|cy"
+ *   south → horizontal wall above row cy+1 → "h|cx|cy+1"  (= north of cell below)
+ *   west  → vertical wall left of col cx  → "v|cx|cy"
+ *   east  → vertical wall left of col cx+1 → "v|cx+1|cy" (= west of cell to right)
+ */
+function wallKey(cx, cy, dir) {
+  if (dir === 'n') return 'h|' + cx + '|' + cy;
+  if (dir === 's') return 'h|' + cx + '|' + (cy + 1);
+  if (dir === 'w') return 'v|' + cx + '|' + cy;
+  if (dir === 'e') return 'v|' + (cx + 1) + '|' + cy;
+  return null;
+}
+
+function getWall(floorIdx, cx, cy, dir) {
+  return state.floors[floorIdx].walls[wallKey(cx, cy, dir)] || null;
+}
+
+function setWall(floorIdx, cx, cy, dir, data) {
+  var k = wallKey(cx, cy, dir);
+  if (data === null) {
+    delete state.floors[floorIdx].walls[k];
+  } else {
+    state.floors[floorIdx].walls[k] = data;
+  }
+}
+
+/* Segment geometry for a wall on cell (cx,cy) side dir — in CELL units */
+function wallSegment(cx, cy, dir) {
+  if (dir === 'n') return { x1: cx,   y1: cy,   x2: cx+1, y2: cy   };
+  if (dir === 's') return { x1: cx,   y1: cy+1, x2: cx+1, y2: cy+1 };
+  if (dir === 'w') return { x1: cx,   y1: cy,   x2: cx,   y2: cy+1 };
+  if (dir === 'e') return { x1: cx+1, y1: cy,   x2: cx+1, y2: cy+1 };
+  return null;
+}
+
+/* Neighbour cell in direction dir */
+function neighbour(cx, cy, dir) {
+  if (dir === 'n') return { x: cx,   y: cy-1 };
+  if (dir === 's') return { x: cx,   y: cy+1 };
+  if (dir === 'w') return { x: cx-1, y: cy   };
+  if (dir === 'e') return { x: cx+1, y: cy   };
+  return null;
+}
+
+/*
+ * Returns the axis-aligned edge directions that belong to a cell type.
+ * Squares have all four edges.  Triangles have one base edge (axis-aligned).
+ * Note: triangles also have 2 diagonal edges tracked separately via triAllEdges().
+ */
+function cellBaseEdges(type) {
+  if (type === 'tri-n') return ['s'];   // base along south edge
+  if (type === 'tri-e') return ['w'];   // base along west edge
+  if (type === 'tri-s') return ['n'];   // base along north edge
+  if (type === 'tri-w') return ['e'];   // base along east edge
+  return ['n', 'e', 's', 'w'];         // square
+}
+
+/* Returns true if the given type is a triangle */
+function isTriangle(type) {
+  return type && type.indexOf('tri-') === 0;
+}
+
+/*
+ * For door placement on triangles: all 3 edges (base + 2 diagonals).
+ * Returns wall-key strings for all edges of cell at (cx,cy).
+ */
+function allWallKeys(cx, cy, type) {
+  if (!isTriangle(type)) {
+    return [wallKey(cx, cy, 'n'), wallKey(cx, cy, 'e'), wallKey(cx, cy, 's'), wallKey(cx, cy, 'w')];
+  }
+  var edges = triAllEdges(type, cx, cy);
+  return edges.map(function(e) { return e.wallKey; });
+}
+
+/* ── GRID OPERATIONS ──────────────────────────────────────────────────────── */
+
+function cellKey(x, y) { return x + ',' + y; }
+
+function getCell(floorIdx, x, y) {
+  return state.floors[floorIdx].cells[cellKey(x, y)] || null;
+}
+
+function setCell(floorIdx, x, y, data) {
+  if (data === null) {
+    delete state.floors[floorIdx].cells[cellKey(x, y)];
+  } else {
+    state.floors[floorIdx].cells[cellKey(x, y)] = data;
+  }
+}
+
+function placeCell(x, y) {
+  var fi   = state.currentFloor;
+  var floor = state.floors[fi];
+  if (floor.cells[cellKey(x, y)]) return; // occupied
+  var type = (state.tool === 'triangle') ? ('tri-' + state.orientation) : 'square';
+  setCell(fi, x, y, { type: type, material: state.material, halfFloor: false });
+}
+
+function eraseCell(x, y) {
+  var fi = state.currentFloor;
+  var existing = state.floors[fi].cells[cellKey(x, y)];
+  if (!existing) return;
+  /* remove TC if it was here */
+  if (state.tcCell && state.tcCell.floor === fi &&
+      state.tcCell.x === x && state.tcCell.y === y) {
+    state.tcCell = null;
+  }
+  /* remove all walls including diagonals */
+  var wkeys = allWallKeys(x, y, existing.type);
+  var walls = state.floors[fi].walls;
+  wkeys.forEach(function(k) { if (k) delete walls[k]; });
+  setCell(fi, x, y, null);
+}
+
+function placeTC(x, y) {
+  var fi   = state.currentFloor;
+  var cell = getCell(fi, x, y);
+  if (!cell) return;
+  state.tcCell = { floor: fi, x: x, y: y };
+}
+
+function toggleDoor(wallInfo) {
+  var fi = state.currentFloor;
+  var fl = state.floors[fi];
+  var wk;
+
+  if (wallInfo.isDiag) {
+    /* diagonal wall between two triangle cells */
+    wk = wallInfo.wallKey;
+    /* need at least one triangle on either side */
+    var hasA = fl.cells[cellKey(wallInfo.x, wallInfo.y)];
+    var hasB = fl.cells[cellKey(wallInfo.nx, wallInfo.ny)];
+    if (!hasA && !hasB) return;
+  } else {
+    var x = wallInfo.x, y = wallInfo.y, dir = wallInfo.dir;
+    var nb  = neighbour(x, y, dir);
+    var hasCell = fl.cells[cellKey(x, y)] || fl.cells[cellKey(nb.x, nb.y)];
+    if (!hasCell) return;
+    wk = wallKey(x, y, dir);
+  }
+
+  if (fl.walls[wk]) {
+    delete fl.walls[wk];
+  } else {
+    fl.walls[wk] = { doorType: state.doorType, doorMaterial: state.doorMaterial };
+  }
+}
+
+/* shorthand */
+function floor(fi) { return state.floors[fi]; }
+
+/* ── COORDINATE HELPERS ───────────────────────────────────────────────────── */
+
+function canvasToWorld(cx, cy) {
+  return {
+    wx: (cx - state.panX) / state.zoom,
+    wy: (cy - state.panY) / state.zoom
+  };
+}
+
+function worldToCell(wx, wy) {
+  return {
+    x: Math.floor(wx / CELL_SIZE),
+    y: Math.floor(wy / CELL_SIZE)
+  };
+}
+
+/*
+ * Detect which wall side (if any) is near the mouse.
+ * Returns { x, y, dir, isDiag, wallKey } or null.
+ * For axis-aligned walls: dir is 'n'/'e'/'s'/'w', isDiag=false.
+ * For diagonal triangle edges: dir=null, isDiag=true, wallKey is the diagEdgeKey.
+ */
+function detectWall(canvasX, canvasY) {
+  var w   = canvasToWorld(canvasX, canvasY);
+  var gx  = w.wx / CELL_SIZE;
+  var gy  = w.wy / CELL_SIZE;
+  var cx  = Math.floor(gx);
+  var cy  = Math.floor(gy);
+  var lx  = gx - cx;   // 0..1 within cell
+  var ly  = gy - cy;
+
+  var fi = state.currentFloor;
+  var fl = floor(fi);
+  var t  = WALL_THRESH;
+
+  /* Check axis-aligned wall proximity first */
+  var axialDir = null;
+  if (ly < t)     axialDir = 'n';
+  if (ly > 1 - t) axialDir = 's';
+  if (lx < t)     axialDir = 'w';
+  if (lx > 1 - t) axialDir = 'e';
+
+  if (axialDir) {
+    /* confirm at least one cell on either side has a foundation */
+    var nb = neighbour(cx, cy, axialDir);
+    var hasCell = fl.cells[cellKey(cx, cy)] || fl.cells[cellKey(nb.x, nb.y)];
+    if (hasCell) {
+      return { x: cx, y: cy, dir: axialDir, isDiag: false, wallKey: wallKey(cx, cy, axialDir) };
+    }
+  }
+
+  /* Check diagonal edges for triangles in neighbouring cells */
+  /* We check cells nearby and see if any triangle diagonal edge passes near pointer */
+  var checkCells = [
+    {x: cx,   y: cy},
+    {x: cx-1, y: cy},   {x: cx+1, y: cy},
+    {x: cx,   y: cy-1}, {x: cx,   y: cy+1},
+    {x: cx-1, y: cy-1}, {x: cx+1, y: cy-1},
+    {x: cx-1, y: cy+1}, {x: cx+1, y: cy+1}
+  ];
+
+  var worldX = gx * CELL_SIZE;
+  var worldY = gy * CELL_SIZE;
+  var best = null, bestDist = WALL_THRESH * CELL_SIZE * 1.5;
+
+  checkCells.forEach(function(cc) {
+    var cell = fl.cells[cellKey(cc.x, cc.y)];
+    if (!cell || !isTriangle(cell.type)) return;
+    var pts = triEdgeSegments(cc.x, cc.y, cell.type);
+    // pts.diagL and pts.diagR are {x1,y1,x2,y2} in world coords
+    ['diagL','diagR'].forEach(function(ename) {
+      var seg = pts[ename];
+      if (!seg) return;
+      var dist = pointToSegmentDist(worldX, worldY, seg.x1, seg.y1, seg.x2, seg.y2);
+      if (dist < bestDist) {
+        bestDist = dist;
+        var diags = triDiagNeighbours(cell.type, cc.x, cc.y);
+        var diagInfo = ename === 'diagL' ? diags[0] : diags[1];
+        best = {
+          x: cc.x, y: cc.y,
+          dir: null,
+          isDiag: true,
+          wallKey: diagEdgeKey(cc.x, cc.y, diagInfo.nx, diagInfo.ny),
+          nx: diagInfo.nx, ny: diagInfo.ny
+        };
+      }
+    });
+  });
+
+  return best;
+}
+
+/* Distance from point (px,py) to segment (ax,ay)-(bx,by) */
+function pointToSegmentDist(px, py, ax, ay, bx, by) {
+  var dx = bx - ax, dy = by - ay;
+  var lenSq = dx*dx + dy*dy;
+  if (lenSq === 0) return Math.sqrt((px-ax)*(px-ax)+(py-ay)*(py-ay));
+  var t = Math.max(0, Math.min(1, ((px-ax)*dx + (py-ay)*dy) / lenSq));
+  var projX = ax + t*dx, projY = ay + t*dy;
+  return Math.sqrt((px-projX)*(px-projX) + (py-projY)*(py-projY));
+}
+
+/*
+ * Returns the world-coordinate segments for diagL and diagR edges of a
+ * triangle cell at (cx,cy) with given type.
+ *
+ * The slant edges run from the apex to the two base-corners.
+ * diagL = left slant (base-left corner),  diagR = right slant (base-right corner).
+ * These match the neighbour order in triDiagNeighbours.
+ *
+ * For the triangular grid to tessellate correctly, the slant segment of a
+ * tri-n at (cx,cy) must align with the slant segment of the tri-s to its left/right.
+ * Since tri-n and tri-s are mirror images of each other, the shared slant of
+ * tri-n(cx,cy).diagL (apex→BL) = tri-s(cx-1,cy).diagR (apex→BR of that cell):
+ *   tri-n apex = (bx+cs/2, by+cs-h);  base-left  = (bx,    by+cs)
+ *   tri-s(cx-1) apex = (bx-cs+cs/2, by+h) = (bx-cs/2, by+h);  base-right = (bx-cs+cs, by) = (bx,    by)
+ * These are NOT collinear for equilateral triangles in separate cells, so the
+ * edges don't geometrically meet.  We therefore keep the visual drawing as-is
+ * (equilateral shape inside the cell bounding box) and use LOGICAL connectivity
+ * for snapping/walls — the slant edges are considered shared by adjacent cells
+ * for purposes of wall placement and snapping, even though visually they don't
+ * perfectly touch at zoom-out.  This matches how Rust blueprint planners work.
+ */
+function triEdgeSegments(cx, cy, type) {
+  var cs = CELL_SIZE;
+  var bx = cx * cs, by = cy * cs;
+  var h  = cs * Math.sqrt(3) / 2;
+  var result = {};
+
+  if (type === 'tri-n') {
+    // apex near top-center, base along south edge
+    var ax = bx + cs/2, ay = by + cs - h;
+    result.diagL = { x1: ax, y1: ay, x2: bx,      y2: by+cs }; // apex → SW corner
+    result.diagR = { x1: ax, y1: ay, x2: bx+cs,   y2: by+cs }; // apex → SE corner
+  } else if (type === 'tri-s') {
+    // apex near bottom-center, base along north edge
+    var ax = bx + cs/2, ay = by + h;
+    result.diagL = { x1: ax, y1: ay, x2: bx,      y2: by    }; // apex → NW corner
+    result.diagR = { x1: ax, y1: ay, x2: bx+cs,   y2: by    }; // apex → NE corner
+  } else if (type === 'tri-e') {
+    // apex near right-center, base along west edge
+    var ax = bx + h, ay = by + cs/2;
+    result.diagL = { x1: ax, y1: ay, x2: bx,      y2: by    }; // apex → NW corner
+    result.diagR = { x1: ax, y1: ay, x2: bx,      y2: by+cs }; // apex → SW corner
+  } else if (type === 'tri-w') {
+    // apex near left-center, base along east edge
+    var ax = bx + cs - h, ay = by + cs/2;
+    result.diagL = { x1: ax, y1: ay, x2: bx+cs,   y2: by    }; // apex → NE corner
+    result.diagR = { x1: ax, y1: ay, x2: bx+cs,   y2: by+cs }; // apex → SE corner
+  }
+  return result;
+}
+
+/* ── RENDERER ─────────────────────────────────────────────────────────────── */
+
+var canvas, ctx;
+
+function initCanvas() {
+  canvas = document.getElementById('grid-canvas');
+  ctx    = canvas.getContext('2d');
+  resizeCanvas();
+  window.addEventListener('resize', resizeCanvas);
+}
+
+function resizeCanvas() {
+  var wrap    = document.getElementById('canvas-wrap');
+  canvas.width  = wrap.clientWidth;
+  canvas.height = wrap.clientHeight;
+  render();
+}
+
+function render() {
+  if (!ctx) return;
+  var W = canvas.width, H = canvas.height;
+
+  ctx.clearRect(0, 0, W, H);
+
+  /* Background */
+  ctx.fillStyle = '#080c11';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.translate(state.panX, state.panY);
+  ctx.scale(state.zoom, state.zoom);
+
+  drawGrid();
+  drawCells();
+  drawWalls();
+  drawTC();
+  drawHoverWall();
+  drawSnapPreview();
+
+  ctx.restore();
+
+  drawOverlay();
+}
+
+/* faint dot-grid */
+function drawGrid() {
+  var lw = 1 / state.zoom;
+
+  /* visible world bounds */
+  var x0 = -state.panX / state.zoom;
+  var y0 = -state.panY / state.zoom;
+  var x1 = (canvas.width  - state.panX) / state.zoom;
+  var y1 = (canvas.height - state.panY) / state.zoom;
+
+  var cxStart = Math.floor(x0 / CELL_SIZE) - 1;
+  var cyStart = Math.floor(y0 / CELL_SIZE) - 1;
+  var cxEnd   = Math.ceil(x1  / CELL_SIZE) + 1;
+  var cyEnd   = Math.ceil(y1  / CELL_SIZE) + 1;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth   = lw;
+
+  for (var gx = cxStart; gx <= cxEnd; gx++) {
+    ctx.beginPath();
+    ctx.moveTo(gx * CELL_SIZE, cyStart * CELL_SIZE);
+    ctx.lineTo(gx * CELL_SIZE, cyEnd   * CELL_SIZE);
+    ctx.stroke();
+  }
+  for (var gy = cyStart; gy <= cyEnd; gy++) {
+    ctx.beginPath();
+    ctx.moveTo(cxStart * CELL_SIZE, gy * CELL_SIZE);
+    ctx.lineTo(cxEnd   * CELL_SIZE, gy * CELL_SIZE);
+    ctx.stroke();
+  }
+}
+
+function drawCells() {
+  var fl = floor(state.currentFloor);
+  Object.keys(fl.cells).forEach(function(k) {
+    var cell = fl.cells[k];
+    var parts = k.split(',');
+    var x = parseInt(parts[0], 10);
+    var y = parseInt(parts[1], 10);
+    drawCell(x, y, cell, fl.isHalfFloor || cell.halfFloor);
+  });
+}
+
+function drawCell(x, y, cell, isHalf) {
+  var mat = MATERIALS[cell.material] || MATERIALS.stone;
+  var bx  = x * CELL_SIZE;
+  var by  = y * CELL_SIZE;
+  var cs  = CELL_SIZE;
+
+  ctx.fillStyle   = mat.fill;
+  ctx.strokeStyle = mat.stroke;
+  ctx.lineWidth   = 1.5 / state.zoom;
+
+  if (cell.type === 'square') {
+    ctx.fillRect(bx + 1, by + 1, cs - 2, cs - 2);
+    ctx.strokeRect(bx + 1, by + 1, cs - 2, cs - 2);
+  } else {
+    drawTriangleCell(ctx, bx, by, cs, cell.type, mat);
+  }
+
+  /* half-floor stripe */
+  if (isHalf) {
+    ctx.fillStyle = 'rgba(255,255,255,0.10)';
+    ctx.fillRect(bx + 1, by + 1, cs - 2, (cs - 2) * 0.3);
+    if (state.zoom >= 0.55) {
+      ctx.fillStyle    = 'rgba(255,255,255,0.55)';
+      ctx.font         = 'bold ' + (10 / state.zoom) + 'px sans-serif';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('½', bx + cs * 0.5, by + cs * 0.18);
+    }
+  }
+}
+
+function drawTriangleCell(ctx, bx, by, cs, type, mat) {
+  /* Height of an equilateral triangle whose side equals cs */
+  var h = cs * Math.sqrt(3) / 2;
+  ctx.beginPath();
+  switch (type) {
+    case 'tri-n': /* apex points north, base along south edge */
+      ctx.moveTo(bx,        by + cs);
+      ctx.lineTo(bx + cs,   by + cs);
+      ctx.lineTo(bx + cs/2, by + cs - h);
+      break;
+    case 'tri-e': /* apex points east, base along west edge */
+      ctx.moveTo(bx,     by);
+      ctx.lineTo(bx,     by + cs);
+      ctx.lineTo(bx + h, by + cs/2);
+      break;
+    case 'tri-s': /* apex points south, base along north edge */
+      ctx.moveTo(bx,        by);
+      ctx.lineTo(bx + cs,   by);
+      ctx.lineTo(bx + cs/2, by + h);
+      break;
+    case 'tri-w': /* apex points west, base along east edge */
+      ctx.moveTo(bx + cs,     by);
+      ctx.lineTo(bx + cs,     by + cs);
+      ctx.lineTo(bx + cs - h, by + cs/2);
+      break;
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+}
+
+/* ── WALL / DOOR RENDERING ────────────────────────────────────────────────── */
+
+function drawWalls() {
+  var fi    = state.currentFloor;
+  var fl    = floor(fi);
+  var drawn = {};
+
+  Object.keys(fl.cells).forEach(function(k) {
+    var parts = k.split(',');
+    var cx = parseInt(parts[0], 10);
+    var cy = parseInt(parts[1], 10);
+    var cell = fl.cells[k];
+
+    if (isTriangle(cell.type)) {
+      /* Draw all 3 edges of the triangle */
+      var edges = triAllEdges(cell.type, cx, cy);
+      edges.forEach(function(edge) {
+        var wk = edge.wallKey;
+        if (drawn[wk]) return;
+        drawn[wk] = true;
+
+        var wallData = fl.walls[wk] || null;
+        var mat = MATERIALS[cell.material] || MATERIALS.stone;
+
+        if (edge.edgeName === 'base') {
+          /* axis-aligned base edge */
+          var seg = wallSegment(cx, cy, cellBaseEdges(cell.type)[0]);
+          var x1 = seg.x1 * CELL_SIZE, y1 = seg.y1 * CELL_SIZE;
+          var x2 = seg.x2 * CELL_SIZE, y2 = seg.y2 * CELL_SIZE;
+          if (wallData && wallData.doorType) {
+            renderDoor(x1, y1, x2, y2, wallData);
+          } else {
+            ctx.strokeStyle = mat.stroke;
+            ctx.lineWidth   = 3.5 / state.zoom;
+            ctx.lineCap     = 'square';
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.stroke();
+          }
+        } else {
+          /* diagonal edge */
+          var segs = triEdgeSegments(cx, cy, cell.type);
+          var seg  = segs[edge.edgeName];
+          if (!seg) return;
+          if (wallData && wallData.doorType) {
+            renderDoor(seg.x1, seg.y1, seg.x2, seg.y2, wallData);
+          } else {
+            ctx.strokeStyle = mat.stroke;
+            ctx.lineWidth   = 3.5 / state.zoom;
+            ctx.lineCap     = 'round';
+            ctx.beginPath();
+            ctx.moveTo(seg.x1, seg.y1);
+            ctx.lineTo(seg.x2, seg.y2);
+            ctx.stroke();
+          }
+        }
+      });
+    } else {
+      /* Square: 4 axis-aligned edges */
+      cellBaseEdges(cell.type).forEach(function(dir) {
+        var wk = wallKey(cx, cy, dir);
+        if (drawn[wk]) return;
+        drawn[wk] = true;
+
+        var seg = wallSegment(cx, cy, dir);
+        var x1  = seg.x1 * CELL_SIZE;
+        var y1  = seg.y1 * CELL_SIZE;
+        var x2  = seg.x2 * CELL_SIZE;
+        var y2  = seg.y2 * CELL_SIZE;
+
+        var nb    = neighbour(cx, cy, dir);
+        var nbCell = fl.cells[cellKey(nb.x, nb.y)] || null;
+        var wallData = fl.walls[wk] || null;
+        var mat  = MATERIALS[(nbCell || cell).material] || MATERIALS.stone;
+
+        if (wallData && wallData.doorType) {
+          renderDoor(x1, y1, x2, y2, wallData);
+        } else {
+          ctx.strokeStyle = mat.stroke;
+          ctx.lineWidth   = 3.5 / state.zoom;
+          ctx.lineCap     = 'square';
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        }
+      });
+    }
+  });
+}
+
+function renderDoor(x1, y1, x2, y2, wd) {
+  var color   = DOOR_COLORS[wd.doorMaterial] || DOOR_COLORS.sheet;
+  var midX    = (x1 + x2) / 2;
+  var midY    = (y1 + y2) / 2;
+  var dx      = x2 - x1;
+  var dy      = y2 - y1;
+  var len     = Math.sqrt(dx * dx + dy * dy);
+  var ux      = dx / len;
+  var uy      = dy / len;
+
+  /* door width depends on type */
+  var fraction = wd.doorType === 'single' ? 0.45
+               : wd.doorType === 'double' ? 0.75
+               : 0.88; /* garage */
+  var hw = (CELL_SIZE * fraction) / 2;
+
+  /* wall stubs on each side */
+  ctx.strokeStyle = MATERIALS.stone.stroke;
+  ctx.lineWidth   = 3.5 / state.zoom;
+  ctx.lineCap     = 'square';
+
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(midX - ux * hw, midY - uy * hw);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(midX + ux * hw, midY + uy * hw);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+
+  /* door segment */
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 5 / state.zoom;
+  ctx.beginPath();
+  ctx.moveTo(midX - ux * hw, midY - uy * hw);
+  ctx.lineTo(midX + ux * hw, midY + uy * hw);
+  ctx.stroke();
+
+  /* door label */
+  if (state.zoom >= 0.5) {
+    var label = wd.doorType === 'single' ? 'S'
+              : wd.doorType === 'double' ? 'D'
+              : 'G';
+    var perpX = -uy * (13 / state.zoom);
+    var perpY =  ux * (13 / state.zoom);
+    ctx.fillStyle    = color;
+    ctx.font         = 'bold ' + (10 / state.zoom) + 'px sans-serif';
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, midX + perpX, midY + perpY);
+  }
+}
+
+function drawTC() {
+  if (!state.tcCell) return;
+  if (state.tcCell.floor !== state.currentFloor) return;
+
+  var x  = state.tcCell.x;
+  var y  = state.tcCell.y;
+  var bx = x * CELL_SIZE;
+  var by = y * CELL_SIZE;
+  var cs = CELL_SIZE;
+
+  /* golden border */
+  ctx.strokeStyle = '#f0a500';
+  ctx.lineWidth   = 3 / state.zoom;
+  ctx.strokeRect(bx + 3, by + 3, cs - 6, cs - 6);
+
+  /* TC label */
+  if (state.zoom >= 0.35) {
+    ctx.fillStyle    = '#f0a500';
+    ctx.font         = 'bold ' + (13 / state.zoom) + 'px sans-serif';
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('TC', bx + cs / 2, by + cs * 0.65);
+  }
+}
+
+/* dim highlight of the wall the user is hovering when door tool is active */
+function drawHoverWall() {
+  if (state.tool !== 'door') return;
+  var hw = state._hoverWall;
+  if (!hw) return;
+
+  ctx.strokeStyle = 'rgba(255,165,0,0.55)';
+  ctx.lineWidth   = 8 / state.zoom;
+  ctx.lineCap     = 'round';
+
+  if (hw.isDiag) {
+    /* find the diagonal segment from one of the triangle cells */
+    var fi = state.currentFloor;
+    var fl = floor(fi);
+    var cell = fl.cells[cellKey(hw.x, hw.y)];
+    if (!cell) return;
+    var segs = triEdgeSegments(hw.x, hw.y, cell.type);
+    /* find which diag this wallKey corresponds to */
+    var diags = triDiagNeighbours(cell.type, hw.x, hw.y);
+    var seg = null;
+    for (var i = 0; i < diags.length; i++) {
+      var dk = diagEdgeKey(hw.x, hw.y, diags[i].nx, diags[i].ny);
+      if (dk === hw.wallKey) {
+        seg = segs[i === 0 ? 'diagL' : 'diagR'];
+        break;
+      }
+    }
+    if (!seg) return;
+    ctx.beginPath();
+    ctx.moveTo(seg.x1, seg.y1);
+    ctx.lineTo(seg.x2, seg.y2);
+    ctx.stroke();
+  } else {
+    var seg = wallSegment(hw.x, hw.y, hw.dir);
+    ctx.beginPath();
+    ctx.moveTo(seg.x1 * CELL_SIZE, seg.y1 * CELL_SIZE);
+    ctx.lineTo(seg.x2 * CELL_SIZE, seg.y2 * CELL_SIZE);
+    ctx.stroke();
+  }
+}
+
+/* ghost preview showing where a foundation will be snapped */
+function drawSnapPreview() {
+  if (state.tool !== 'triangle' && state.tool !== 'square') return;
+  var sp = state._snapPreview;
+  if (!sp) return;
+
+  var fi = state.currentFloor;
+  var fl = floor(fi);
+  if (fl.cells[cellKey(sp.x, sp.y)]) return; /* already occupied */
+
+  var bx = sp.x * CELL_SIZE;
+  var by = sp.y * CELL_SIZE;
+  var cs = CELL_SIZE;
+  var h  = cs * Math.sqrt(3) / 2;
+
+  ctx.save();
+  ctx.globalAlpha = 0.32;
+  ctx.fillStyle   = MATERIALS[state.material] ? MATERIALS[state.material].fill : MATERIALS.stone.fill;
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth   = 2 / state.zoom;
+  ctx.setLineDash([4 / state.zoom, 4 / state.zoom]);
+
+  ctx.beginPath();
+  switch (sp.type) {
+    case 'square':
+      ctx.rect(bx + 1, by + 1, cs - 2, cs - 2);
+      break;
+    case 'tri-n':
+      ctx.moveTo(bx,        by + cs);
+      ctx.lineTo(bx + cs,   by + cs);
+      ctx.lineTo(bx + cs/2, by + cs - h);
+      break;
+    case 'tri-e':
+      ctx.moveTo(bx,     by);
+      ctx.lineTo(bx,     by + cs);
+      ctx.lineTo(bx + h, by + cs/2);
+      break;
+    case 'tri-s':
+      ctx.moveTo(bx,        by);
+      ctx.lineTo(bx + cs,   by);
+      ctx.lineTo(bx + cs/2, by + h);
+      break;
+    case 'tri-w':
+      ctx.moveTo(bx + cs,     by);
+      ctx.lineTo(bx + cs,     by + cs);
+      ctx.lineTo(bx + cs - h, by + cs/2);
+      break;
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+/* top-left overlay (floor label) drawn in canvas-space, after ctx.restore() */
+function drawOverlay() {
+  ctx.fillStyle    = 'rgba(255,255,255,0.25)';
+  ctx.font         = '13px sans-serif';
+  ctx.textAlign    = 'left';
+  ctx.textBaseline = 'top';
+  var fl = floor(state.currentFloor);
+  var label = 'Floor ' + (state.currentFloor + 1) + ' / ' + state.floors.length;
+  if (fl.isHalfFloor) label += '  [Half Floor]';
+  ctx.fillText(label, 10, 10);
+}
+
+/* ── EVENT HANDLING ───────────────────────────────────────────────────────── */
+
+function initEvents() {
+  /* ── canvas ── */
+  canvas.addEventListener('mousedown',    onMouseDown);
+  canvas.addEventListener('mousemove',    onMouseMove);
+  canvas.addEventListener('mouseup',      onMouseUp);
+  canvas.addEventListener('mouseleave',   onMouseLeave);
+  canvas.addEventListener('wheel',        onWheel, { passive: false });
+  canvas.addEventListener('contextmenu',  function(e) { e.preventDefault(); });
+
+  /* ── tool buttons ── */
+  document.querySelectorAll('.tool-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.tool-btn').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      state.tool = btn.dataset.tool;
+      syncToolUI();
+    });
+  });
+
+  document.querySelectorAll('.orient-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.orient-btn').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      state.orientation = btn.dataset.orient;
+    });
+  });
+
+  document.querySelectorAll('.mat-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.mat-btn').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      state.material = btn.dataset.mat;
+    });
+  });
+
+  document.querySelectorAll('.dtype-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.dtype-btn').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      state.doorType = btn.dataset.dtype;
+    });
+  });
+
+  document.querySelectorAll('.dmat-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.dmat-btn').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      state.doorMaterial = btn.dataset.dmat;
+    });
+  });
+
+  /* ── floor controls ── */
+  document.getElementById('btn-prev-floor').addEventListener('click', function() {
+    if (state.currentFloor > 0) { state.currentFloor--; syncFloorUI(); }
+  });
+
+  document.getElementById('btn-next-floor').addEventListener('click', function() {
+    if (state.currentFloor < state.floors.length - 1) { state.currentFloor++; syncFloorUI(); }
+  });
+
+  document.getElementById('btn-add-floor').addEventListener('click', function() {
+    if (state.floors.length >= 12) return;
+    state.floors.push(makeFloor());
+    state.currentFloor = state.floors.length - 1;
+    syncFloorUI();
+  });
+
+  document.getElementById('btn-remove-floor').addEventListener('click', function() {
+    if (state.floors.length <= 1) return;
+    /* remove TC if it was on this floor */
+    if (state.tcCell && state.tcCell.floor === state.currentFloor) state.tcCell = null;
+    /* adjust TC floor index if it was above the removed floor */
+    if (state.tcCell && state.tcCell.floor > state.currentFloor) state.tcCell.floor--;
+    state.floors.splice(state.currentFloor, 1);
+    if (state.currentFloor >= state.floors.length) state.currentFloor = state.floors.length - 1;
+    syncFloorUI();
+  });
+
+  document.getElementById('half-floor-toggle').addEventListener('change', function(e) {
+    floor(state.currentFloor).isHalfFloor = e.target.checked;
+    render();
+  });
+
+  /* ── action buttons ── */
+  document.getElementById('btn-clear-floor').addEventListener('click', function() {
+    if (!confirm('Clear all foundations on this floor?')) return;
+    if (state.tcCell && state.tcCell.floor === state.currentFloor) state.tcCell = null;
+    state.floors[state.currentFloor] = makeFloor();
+    syncFloorUI();
+  });
+
+  document.getElementById('btn-clear-all').addEventListener('click', function() {
+    if (!confirm('Clear ALL floors?')) return;
+    state.floors = [ makeFloor() ];
+    state.currentFloor = 0;
+    state.tcCell = null;
+    syncFloorUI();
+  });
+
+  /* ── raid calculator ── */
+  document.getElementById('btn-calc-raid').addEventListener('click', doRaidCalc);
+}
+
+/* ── mouse handlers ── */
+
+function onMouseDown(e) {
+  e.preventDefault();
+  var rect = canvas.getBoundingClientRect();
+  var mx = e.clientX - rect.left;
+  var my = e.clientY - rect.top;
+
+  /* middle-click or alt+left → pan */
+  if (e.button === 1 || (e.button === 0 && e.altKey)) {
+    state._pan = true;
+    state._panAnchorX = mx - state.panX;
+    state._panAnchorY = my - state.panY;
+    canvas.style.cursor = 'grabbing';
+    return;
+  }
+
+  /* right-click → erase */
+  if (e.button === 2) {
+    state._erase = true;
+    handleErase(mx, my);
+    render(); updateStats();
+    return;
+  }
+
+  /* left-click → active tool */
+  if (e.button === 0) {
+    state._drag = true;
+    handlePlace(mx, my);
+    render(); updateStats();
+  }
+}
+
+function onMouseMove(e) {
+  var rect = canvas.getBoundingClientRect();
+  var mx = e.clientX - rect.left;
+  var my = e.clientY - rect.top;
+
+  if (state._pan) {
+    state.panX = mx - state._panAnchorX;
+    state.panY = my - state._panAnchorY;
+    render();
+    return;
+  }
+
+  /* update hover-wall highlight for door tool */
+  if (state.tool === 'door') {
+    state._hoverWall = detectWall(mx, my);
+    render();
+  }
+
+  /* update snap preview for triangle tool */
+  if (state.tool === 'triangle') {
+    var w  = canvasToWorld(mx, my);
+    var gx = w.wx / CELL_SIZE;
+    var gy = w.wy / CELL_SIZE;
+    var cx = Math.floor(gx);
+    var cy = Math.floor(gy);
+    var fi = state.currentFloor;
+    var fl = state.floors[fi];
+
+    var snapResult = findTriangleEdgeSnap(gx, gy, fi, fl);
+    if (snapResult) {
+      state._snapPreview = { x: snapResult.nx, y: snapResult.ny, type: snapResult.ntype };
+    } else {
+      var sqSnap = findSquareEdgeSnapForTriangle(gx, gy, fi, fl);
+      if (sqSnap) {
+        state._snapPreview = { x: sqSnap.nx, y: sqSnap.ny, type: sqSnap.ntype };
+      } else {
+        var gridType = getTriangleGridType(cx, cy, fi, fl);
+        if (gridType) {
+          state._snapPreview = { x: cx, y: cy, type: gridType };
+        } else {
+          state._snapPreview = { x: cx, y: cy, type: 'tri-' + state.orientation };
+        }
+      }
+    }
+    render();
+  } else if (state.tool === 'square') {
+    /* show snap preview for square placement near triangles */
+    var w  = canvasToWorld(mx, my);
+    var gx = w.wx / CELL_SIZE;
+    var gy = w.wy / CELL_SIZE;
+    var cx = Math.floor(gx);
+    var cy = Math.floor(gy);
+    var fi = state.currentFloor;
+    var fl = state.floors[fi];
+    var sqForTri = findSquarePlacementOnTriBase(gx, gy, fi, fl);
+    if (sqForTri) {
+      state._snapPreview = { x: sqForTri.nx, y: sqForTri.ny, type: 'square' };
+    } else {
+      state._snapPreview = { x: cx, y: cy, type: 'square' };
+    }
+    render();
+  } else if (state._snapPreview) {
+    state._snapPreview = null;
+    render();
+  }
+
+  if (state._drag) {
+    var tool = state.tool;
+    if (tool === 'square' || tool === 'triangle' || tool === 'erase') {
+      if (tool === 'erase') { handleErase(mx, my); }
+      else                  { handlePlace(mx, my); }
+      render(); updateStats();
+    }
+  }
+
+  if (state._erase) {
+    handleErase(mx, my);
+    render(); updateStats();
+  }
+}
+
+function onMouseUp() {
+  state._drag  = false;
+  state._erase = false;
+  state._pan   = false;
+  canvas.style.cursor = 'crosshair';
+}
+
+function onMouseLeave() {
+  onMouseUp();
+  state._snapPreview = null;
+  state._hoverWall   = null;
+  render();
+}
+
+function onWheel(e) {
+  e.preventDefault();
+  var rect  = canvas.getBoundingClientRect();
+  var mx    = e.clientX - rect.left;
+  var my    = e.clientY - rect.top;
+  var delta = e.deltaY > 0 ? 0.88 : 1.14;
+  var nz    = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, state.zoom * delta));
+  state.panX = mx - (mx - state.panX) * (nz / state.zoom);
+  state.panY = my - (my - state.panY) * (nz / state.zoom);
+  state.zoom = nz;
+  render();
+}
+
+/* ── placement logic ── */
+
+function handlePlace(mx, my) {
+  var tool = state.tool;
+
+  if (tool === 'door') {
+    var wall = detectWall(mx, my);
+    if (wall) { toggleDoor(wall); }
+    return;
+  }
+
+  if (tool === 'tc') {
+    var w   = canvasToWorld(mx, my);
+    var cell = worldToCell(w.wx, w.wy);
+    placeTC(cell.x, cell.y);
+    return;
+  }
+
+  if (tool === 'erase') {
+    handleErase(mx, my);
+    return;
+  }
+
+  /* square / triangle */
+  if (tool === 'triangle') {
+    handleTrianglePlacement(mx, my);
+  } else {
+    var wp = canvasToWorld(mx, my);
+    var cp = worldToCell(wp.wx, wp.wy);
+    /* For the square tool: if clicking on a triangle base edge, place square on that side */
+    var sqForTri = findSquarePlacementOnTriBase(wp.wx / CELL_SIZE, wp.wy / CELL_SIZE, state.currentFloor, floor(state.currentFloor));
+    if (sqForTri) {
+      placeSquareAt(sqForTri.nx, sqForTri.ny);
+    } else {
+      placeCell(cp.x, cp.y);
+    }
+  }
+}
+
+function placeSquareAt(x, y) {
+  var fi = state.currentFloor;
+  if (state.floors[fi].cells[cellKey(x, y)]) return;
+  setCell(fi, x, y, { type: 'square', material: state.material, halfFloor: false });
+}
+
+/*
+ * If the mouse is near the BASE edge of a triangle, return the neighbour cell
+ * position for placing a square there.
+ */
+function findSquarePlacementOnTriBase(gx, gy, fi, fl) {
+  var cx = Math.floor(gx);
+  var cy = Math.floor(gy);
+  var lx = gx - cx, ly = gy - cy;
+  var t  = 0.30;
+
+  var checkDirs = [];
+  if (ly < t)     checkDirs.push({ cx: cx, cy: cy, dir: 'n' });
+  if (ly > 1 - t) checkDirs.push({ cx: cx, cy: cy, dir: 's' });
+  if (lx < t)     checkDirs.push({ cx: cx, cy: cy, dir: 'w' });
+  if (lx > 1 - t) checkDirs.push({ cx: cx, cy: cy, dir: 'e' });
+
+  for (var i = 0; i < checkDirs.length; i++) {
+    var entry = checkDirs[i];
+    var cell = fl.cells[cellKey(entry.cx, entry.cy)];
+    if (cell && isTriangle(cell.type)) {
+      var baseDir = cellBaseEdges(cell.type)[0];
+      if (baseDir === entry.dir) {
+        var nb = neighbour(entry.cx, entry.cy, entry.dir);
+        if (!fl.cells[cellKey(nb.x, nb.y)]) {
+          return { nx: nb.x, ny: nb.y };
+        }
+      }
+    }
+    /* Also check: standing in empty cell, triangle is in the neighbour */
+    var nb = neighbour(entry.cx, entry.cy, entry.dir);
+    var nbCell = fl.cells[cellKey(nb.x, nb.y)];
+    if (!cell && nbCell && isTriangle(nbCell.type)) {
+      var baseDir = cellBaseEdges(nbCell.type)[0];
+      if (baseDir === oppositeDir(entry.dir)) {
+        if (!cell) {
+          return { nx: entry.cx, ny: entry.cy };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/*
+ * Triangle placement with grid snapping.
+ *
+ * Strategy:
+ * 1. Get the cell the mouse is in.
+ * 2. Check if mouse is near a triangle edge of an EXISTING triangle — if so,
+ *    place the auto-rotated neighbour on that edge.
+ * 3. Otherwise, check if the cell is on an existing triangle grid — if so,
+ *    snap to the grid (place with the grid-determined type).
+ * 4. Otherwise, just place a triangle with the current orientation.
+ */
+function handleTrianglePlacement(mx, my) {
+  var w  = canvasToWorld(mx, my);
+  var gx = w.wx / CELL_SIZE;
+  var gy = w.wy / CELL_SIZE;
+  var cx = Math.floor(gx);
+  var cy = Math.floor(gy);
+
+  var fi = state.currentFloor;
+  var fl = state.floors[fi];
+
+  /* Check if near an existing triangle edge → place auto-rotated neighbour */
+  var snapResult = findTriangleEdgeSnap(gx, gy, fi, fl);
+  if (snapResult) {
+    placeTriangleAt(snapResult.nx, snapResult.ny, snapResult.ntype);
+    return;
+  }
+
+  /* Check if near a square edge → place a triangle on that side */
+  var sqSnapResult = findSquareEdgeSnapForTriangle(gx, gy, fi, fl);
+  if (sqSnapResult) {
+    placeTriangleAt(sqSnapResult.nx, sqSnapResult.ny, sqSnapResult.ntype);
+    return;
+  }
+
+  /* Check if this cell is on an existing triangle grid */
+  var gridType = getTriangleGridType(cx, cy, fi, fl);
+  if (gridType) {
+    placeTriangleAt(cx, cy, gridType);
+    return;
+  }
+
+  /* Free placement with current orientation */
+  placeTriangleAt(cx, cy, 'tri-' + state.orientation);
+}
+
+/*
+ * Check if mouse (gx,gy in cell units) is near a triangle edge of an existing
+ * triangle, and return the neighbour position and type to place.
+ * Returns { nx, ny, ntype } or null.
+ */
+function findTriangleEdgeSnap(gx, gy, fi, fl) {
+  var worldX = gx * CELL_SIZE;
+  var worldY = gy * CELL_SIZE;
+  var cx = Math.floor(gx);
+  var cy = Math.floor(gy);
+  var snapDist = CELL_SIZE * 0.45;
+
+  /* Check surrounding cells */
+  var checkCells = [
+    {x: cx,   y: cy},
+    {x: cx-1, y: cy},   {x: cx+1, y: cy},
+    {x: cx,   y: cy-1}, {x: cx,   y: cy+1},
+    {x: cx-1, y: cy-1}, {x: cx+1, y: cy-1},
+    {x: cx-1, y: cy+1}, {x: cx+1, y: cy+1}
+  ];
+
+  var best = null, bestDist = snapDist;
+
+  checkCells.forEach(function(cc) {
+    var cell = fl.cells[cellKey(cc.x, cc.y)];
+    if (!cell || !isTriangle(cell.type)) return;
+
+    var diags = triDiagNeighbours(cell.type, cc.x, cc.y);
+    var segs  = triEdgeSegments(cc.x, cc.y, cell.type);
+
+    ['diagL','diagR'].forEach(function(ename, idx) {
+      var seg = segs[ename];
+      if (!seg) return;
+      var dist = pointToSegmentDist(worldX, worldY, seg.x1, seg.y1, seg.x2, seg.y2);
+      if (dist < bestDist) {
+        var diagInfo = diags[idx];
+        /* Only snap if the target cell is empty */
+        if (!fl.cells[cellKey(diagInfo.nx, diagInfo.ny)]) {
+          bestDist = dist;
+          best = { nx: diagInfo.nx, ny: diagInfo.ny, ntype: diagInfo.ntype };
+        }
+      }
+    });
+
+    /* Also check placing on the base edge */
+    var baseDir;
+    if (cell.type === 'tri-n') baseDir = 's';
+    else if (cell.type === 'tri-e') baseDir = 'w';
+    else if (cell.type === 'tri-s') baseDir = 'n';
+    else if (cell.type === 'tri-w') baseDir = 'e';
+    var nb = neighbour(cc.x, cc.y, baseDir);
+    if (!fl.cells[cellKey(nb.x, nb.y)]) {
+      /* mid-point of base edge */
+      var seg = wallSegment(cc.x, cc.y, baseDir);
+      var midX = (seg.x1 + seg.x2) / 2 * CELL_SIZE;
+      var midY = (seg.y1 + seg.y2) / 2 * CELL_SIZE;
+      var dist = Math.sqrt((worldX-midX)*(worldX-midX)+(worldY-midY)*(worldY-midY));
+      if (dist < bestDist) {
+        bestDist = dist;
+        /* Mirror type: new tri has apex pointing away from the source's base */
+        var oppType = mirrorTriType(cell.type);
+        best = { nx: nb.x, ny: nb.y, ntype: oppType };
+      }
+    }
+  });
+
+  return best;
+}
+
+/*
+ * Returns the triangle type to place against the BASE edge of a given triangle.
+ * The new triangle's base faces the existing triangle (apex points away).
+ *   tri-n base is on SOUTH → new cell is to the south → new tri has base on NORTH → tri-s
+ *   tri-s base is on NORTH → new cell is to the north → new tri has base on SOUTH → tri-n
+ *   tri-e base is on WEST  → new cell is to the west  → new tri has base on EAST  → tri-w
+ *   tri-w base is on EAST  → new cell is to the east  → new tri has base on WEST  → tri-e
+ */
+function mirrorTriType(type) {
+  if (type === 'tri-n') return 'tri-s';
+  if (type === 'tri-s') return 'tri-n';
+  if (type === 'tri-e') return 'tri-w';
+  if (type === 'tri-w') return 'tri-e';
+  return type;
+}
+
+/*
+ * Check if mouse is near the edge of a SQUARE cell, to auto-place a triangle
+ * adjacent to a square.
+ */
+function findSquareEdgeSnapForTriangle(gx, gy, fi, fl) {
+  var cx = Math.floor(gx);
+  var cy = Math.floor(gy);
+  var lx = gx - cx;
+  var ly = gy - cy;
+  var t  = 0.35; /* broader threshold for square→triangle snapping */
+
+  var dirs = [];
+  if (ly < t)     dirs.push('n');
+  if (ly > 1 - t) dirs.push('s');
+  if (lx < t)     dirs.push('w');
+  if (lx > 1 - t) dirs.push('e');
+
+  for (var i = 0; i < dirs.length; i++) {
+    var dir = dirs[i];
+    var cell = fl.cells[cellKey(cx, cy)];
+    var nb   = neighbour(cx, cy, dir);
+    var nbCell = fl.cells[cellKey(nb.x, nb.y)];
+
+    /* If the current cell is a square and the neighbour is empty, or vice versa */
+    if (cell && cell.type === 'square' && !nbCell) {
+      /* Place a triangle pointing INTO the square from the outside */
+      var triType = squareDirToTriType(dir);
+      return { nx: nb.x, ny: nb.y, ntype: triType };
+    }
+    if (!cell && nbCell && nbCell.type === 'square') {
+      var triType = squareDirToTriType(oppositeDir(dir));
+      return { nx: cx, ny: cy, ntype: triType };
+    }
+  }
+  return null;
+}
+
+function oppositeDir(dir) {
+  if (dir === 'n') return 's';
+  if (dir === 's') return 'n';
+  if (dir === 'e') return 'w';
+  if (dir === 'w') return 'e';
+  return dir;
+}
+
+/* Return the best-fit triangle type to place on a given side of a square.
+ * The triangle's BASE faces the square (apex points away from the square). */
+function squareDirToTriType(dir) {
+  if (dir === 'n') return 'tri-n'; // north of square: base along south = faces square, apex points north
+  if (dir === 's') return 'tri-s'; // south of square: base along north = faces square, apex points south
+  if (dir === 'e') return 'tri-e'; // east  of square: base along west  = faces square, apex points east
+  if (dir === 'w') return 'tri-w'; // west  of square: base along east  = faces square, apex points west
+  return 'tri-n';
+}
+
+/*
+ * Given a cell position, determine what triangle type it SHOULD be based on
+ * existing neighbours' grid alignment.
+ * Returns a tri type string or null.
+ *
+ * Checks both diagonal neighbours (same-row slant sharing) and base-edge
+ * neighbours (a tri placed next to the base of an existing tri should mirror it).
+ */
+function getTriangleGridType(cx, cy, fi, fl) {
+  /* ── diagonal neighbour check ── */
+  /* If any surrounding triangle has (cx,cy) as one of its diagonal neighbours */
+  var checkDiag = [
+    {x: cx-1, y: cy}, {x: cx+1, y: cy},
+    {x: cx,   y: cy-1}, {x: cx, y: cy+1}
+  ];
+  for (var i = 0; i < checkDiag.length; i++) {
+    var cc = checkDiag[i];
+    var cell = fl.cells[cellKey(cc.x, cc.y)];
+    if (!cell || !isTriangle(cell.type)) continue;
+    var diags = triDiagNeighbours(cell.type, cc.x, cc.y);
+    for (var j = 0; j < diags.length; j++) {
+      if (diags[j].nx === cx && diags[j].ny === cy) {
+        return diags[j].ntype;
+      }
+    }
+  }
+
+  /* ── base-edge neighbour check ── */
+  /* If there is a triangle whose base edge faces (cx,cy), the new tri mirrors it */
+  var baseChecks = [
+    { dx: 0,  dy: -1, dir: 's' }, // tri to the north with base pointing south
+    { dx: 0,  dy:  1, dir: 'n' }, // tri to the south with base pointing north
+    { dx: -1, dy:  0, dir: 'e' }, // tri to the west  with base pointing east
+    { dx:  1, dy:  0, dir: 'w' }  // tri to the east  with base pointing west
+  ];
+  for (var i = 0; i < baseChecks.length; i++) {
+    var bc = baseChecks[i];
+    var nc = fl.cells[cellKey(cx + bc.dx, cy + bc.dy)];
+    if (!nc || !isTriangle(nc.type)) continue;
+    if (cellBaseEdges(nc.type)[0] === bc.dir) {
+      return mirrorTriType(nc.type);
+    }
+  }
+
+  return null;
+}
+
+function placeTriangleAt(x, y, type) {
+  var fi = state.currentFloor;
+  var fl = state.floors[fi];
+  if (fl.cells[cellKey(x, y)]) return; /* occupied */
+  setCell(fi, x, y, { type: type, material: state.material, halfFloor: false });
+}
+
+function handleErase(mx, my) {
+  /* first try to remove a door on the nearest wall */
+  var wall = detectWall(mx, my);
+  if (wall) {
+    var fi = state.currentFloor;
+    var fl = state.floors[fi];
+    var wk = wall.wallKey || (wall.dir ? wallKey(wall.x, wall.y, wall.dir) : null);
+    if (wk && fl.walls[wk]) { delete fl.walls[wk]; return; }
+  }
+  /* otherwise erase cell */
+  var wp = canvasToWorld(mx, my);
+  var cp = worldToCell(wp.wx, wp.wy);
+  eraseCell(cp.x, cp.y);
+}
+
+/* ── UI SYNC ──────────────────────────────────────────────────────────────── */
+
+function syncToolUI() {
+  var t = state.tool;
+  document.getElementById('triangle-options').classList.toggle('hidden', t !== 'triangle');
+  document.getElementById('door-options').classList.toggle('hidden', t !== 'door');
+  /* clear hover highlight when switching away from door tool */
+  if (t !== 'door') state._hoverWall = null;
+  /* clear snap preview when switching away from placement tools */
+  if (t !== 'triangle' && t !== 'square') state._snapPreview = null;
+  render();
+}
+
+function syncFloorUI() {
+  document.getElementById('floor-display').textContent =
+    'Floor ' + (state.currentFloor + 1);
+  document.getElementById('half-floor-toggle').checked =
+    floor(state.currentFloor).isHalfFloor;
+  updateStats();
+  render();
+}
+
+function updateStats() {
+  var squares = 0, triangles = 0, doors = 0;
+  state.floors.forEach(function(fl) {
+    Object.values(fl.cells).forEach(function(c) {
+      if (c.type === 'square') squares++;
+      else triangles++;
+    });
+    Object.values(fl.walls).forEach(function(w) {
+      if (w && w.doorType) doors++;
+    });
+  });
+
+  document.getElementById('stat-floors').textContent    = state.floors.length;
+  document.getElementById('stat-squares').textContent   = squares;
+  document.getElementById('stat-triangles').textContent = triangles;
+  document.getElementById('stat-area').textContent      = (squares + triangles * 0.5).toFixed(1); // triangles count as ½ foundation each
+  document.getElementById('stat-doors').textContent     = doors;
+  document.getElementById('stat-tc').textContent        =
+    state.tcCell
+      ? 'Floor ' + (state.tcCell.floor + 1) + ' (' + state.tcCell.x + ',' + state.tcCell.y + ')'
+      : '—';
+}
+
+/* ── RAID CALCULATOR ─────────────────────────────────────────────────────── */
+
+/*
+ * Algorithm: Dijkstra from virtual node "__outside__" to the TC cell.
+ *
+ * Nodes  : "__outside__"  +  every "x,y" cell key on the TC's floor
+ * Edges  :
+ *   outside → any cell that has an exterior wall edge (i.e. the cell is present
+ *             but there is no foundation on the other side of that edge):
+ *       cost = wallCost if no door, else doorCost
+ *   cell A → adjacent cell B (both present):
+ *       cost = wallCost if no door, else doorCost
+ *             (you always have to breach something between adjacent rooms)
+ *
+ * If the TC is unreachable from outside we report that.
+ * Only the floor the TC is on is analysed (ground-floor entry assumption).
+ */
+
+function doRaidCalc() {
+  var resultsEl = document.getElementById('raid-results');
+
+  if (!state.tcCell) {
+    resultsEl.innerHTML = '<p class="hint">⚠️ Place a TC first!</p>';
+    return;
+  }
+
+  var fi          = state.tcCell.floor;
+  var fl          = floor(fi);
+  var cells       = fl.cells;
+  var walls       = fl.walls;
+  var baseMat     = document.getElementById('raid-base-mat').value;
+  var defaultDoor = document.getElementById('raid-door-mat').value;
+
+  if (Object.keys(cells).length === 0) {
+    resultsEl.innerHTML = '<p class="hint">⚠️ No foundations on TC floor!</p>';
+    return;
+  }
+
+  var wCost = RAID_COSTS.wall[baseMat] || RAID_COSTS.wall.stone;
+
+  function edgeCost(wk) {
+    var wd = walls[wk] || null;
+    if (wd && wd.doorType) {
+      var dc = RAID_COSTS.door[wd.doorMaterial] || RAID_COSTS.door[defaultDoor];
+      return dc.rockets;
+    }
+    return wCost.rockets;
+  }
+
+  /* build adjacency list */
+  var OUTSIDE = '__outside__';
+  var graph   = {};
+  graph[OUTSIDE] = [];
+
+  Object.keys(cells).forEach(function(k) {
+    graph[k] = graph[k] || [];
+    var parts = k.split(',');
+    var cx    = parseInt(parts[0], 10);
+    var cy    = parseInt(parts[1], 10);
+    var cell  = cells[k];
+
+    if (isTriangle(cell.type)) {
+      /* All 3 edges — add both directions explicitly */
+      var edges = triAllEdges(cell.type, cx, cy);
+      edges.forEach(function(edge) {
+        var nbk = cellKey(edge.neighbour.x, edge.neighbour.y);
+        var wk  = edge.wallKey;
+        var cost = edgeCost(wk);
+        if (cells[nbk]) {
+          /* interior edge — add both directions to avoid missing reverse */
+          graph[k].push({ to: nbk, cost: cost });
+          graph[nbk] = graph[nbk] || [];
+          graph[nbk].push({ to: k, cost: cost });
+        } else {
+          graph[k].push({ to: OUTSIDE, cost: cost });
+          graph[OUTSIDE].push({ to: k, cost: cost });
+        }
+      });
+    } else {
+      cellBaseEdges(cell.type).forEach(function(dir) {
+        var nb   = neighbour(cx, cy, dir);
+        var nbk  = cellKey(nb.x, nb.y);
+        var wk   = wallKey(cx, cy, dir);
+        var cost = edgeCost(wk);
+
+        if (cells[nbk]) {
+          /* interior edge — add both directions */
+          graph[k].push({ to: nbk, cost: cost });
+          graph[nbk] = graph[nbk] || [];
+          graph[nbk].push({ to: k, cost: cost });
+        } else {
+          /* exterior edge */
+          graph[k].push({ to: OUTSIDE, cost: cost });
+          graph[OUTSIDE].push({ to: k, cost: cost });
+        }
+      });
+    }
+  });
+
+  var tcKey = cellKey(state.tcCell.x, state.tcCell.y);
+  if (!cells[tcKey]) {
+    resultsEl.innerHTML = '<p class="hint">⚠️ TC cell not found on this floor!</p>';
+    return;
+  }
+
+  var result = dijkstra(graph, OUTSIDE, tcKey);
+
+  if (!isFinite(result.cost)) {
+    resultsEl.innerHTML = '<p class="hint">⚠️ TC is unreachable from outside!</p>';
+    return;
+  }
+
+  /* convert total rockets to satchels/C4 proportionally */
+  var rockets  = result.cost;
+  var satchels = Math.round(rockets * wCost.satchels / wCost.rockets);
+  var c4       = Math.ceil(rockets  * wCost.c4      / wCost.rockets);
+
+  /* path description */
+  var pathNodes = result.path.filter(function(n) { return n !== OUTSIDE; });
+  var pathStr   = pathNodes.map(function(n) { return '(' + n + ')'; }).join(' → ');
+
+  var html = '<div class="raid-row"><span>🚀 Rockets</span><span><strong>' + rockets + '</strong></span></div>'
+           + '<div class="raid-row"><span>💣 ~Satchels</span><span><strong>' + satchels + '</strong></span></div>'
+           + '<div class="raid-row"><span>💥 ~C4</span><span><strong>' + c4 + '</strong></span></div>'
+           + '<div class="raid-total"><span>Estimated cost</span><span>~' + rockets + ' rockets</span></div>';
+
+  if (pathStr) {
+    html += '<div class="raid-path">Path: outside → ' + pathStr + '</div>';
+  }
+
+  resultsEl.innerHTML = html;
+}
+
+/* Standard Dijkstra — works for small graphs (≤ a few hundred nodes). */
+function dijkstra(graph, start, end) {
+  var dist  = {};
+  var prev  = {};
+  var visited = {};
+  var nodes   = Object.keys(graph);
+
+  nodes.forEach(function(n) { dist[n] = Infinity; });
+  dist[start] = 0;
+
+  /* naive priority queue as sorted array — fine for blueprint-sized graphs */
+  var pq = [{ node: start, cost: 0 }];
+
+  while (pq.length > 0) {
+    pq.sort(function(a, b) { return a.cost - b.cost; });
+    var cur = pq.shift();
+    if (visited[cur.node]) continue;
+    visited[cur.node] = true;
+    if (cur.node === end) break;
+
+    var edges = graph[cur.node] || [];
+    for (var i = 0; i < edges.length; i++) {
+      var e = edges[i];
+      if (visited[e.to]) continue;
+      var nd = cur.cost + e.cost;
+      if (nd < dist[e.to]) {
+        dist[e.to] = nd;
+        prev[e.to] = cur.node;
+        pq.push({ node: e.to, cost: nd });
+      }
+    }
+  }
+
+  /* reconstruct path */
+  var path = [];
+  var node = end;
+  while (node) {
+    path.unshift(node);
+    node = prev[node];
+    if (node === start) { path.unshift(start); break; }
+  }
+
+  return { cost: dist[end], path: path };
+}
+
+/* ── INIT ─────────────────────────────────────────────────────────────────── */
+
+function init() {
+  initCanvas();
+  initEvents();
+
+  /* centre the view on a comfortable starting area */
+  state.panX = canvas.width  / 2 - 10 * CELL_SIZE * state.zoom;
+  state.panY = canvas.height / 2 - 10 * CELL_SIZE * state.zoom;
+
+  syncFloorUI();
+  syncToolUI();
+}
+
+document.addEventListener('DOMContentLoaded', init);
