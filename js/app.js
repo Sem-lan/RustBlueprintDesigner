@@ -593,6 +593,42 @@ function drawPiece(piece, floorHalf) {
       ctx.fillText('\u00bd', piece.cx, piece.cy - 5 / state.zoom);
     }
   }
+
+  if (piece.isLoot) {
+    ctx.fillStyle = 'rgba(80,200,100,0.40)';
+    ctx.beginPath();
+    ctx.moveTo(verts[0].x, verts[0].y);
+    for (var i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = '#50c864';
+    ctx.lineWidth = 2.5 / state.zoom;
+    ctx.stroke();
+    if (state.zoom >= 0.4) {
+      ctx.fillStyle = '#50c864';
+      ctx.font = 'bold ' + (9 / state.zoom) + 'px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('LOOT', piece.cx, piece.cy);
+    }
+  }
+
+  if (piece.isHC) {
+    ctx.fillStyle = 'rgba(255, 180, 40, 0.30)';
+    ctx.beginPath();
+    ctx.moveTo(verts[0].x, verts[0].y);
+    for (var i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
+    ctx.closePath();
+    ctx.fill();
+
+    if (state.zoom >= 0.4) {
+      ctx.fillStyle = '#ffd84a';
+      ctx.font = 'bold ' + (9 / state.zoom) + 'px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('HC', piece.cx, piece.cy);
+    }
+  }
 }
 
 function drawEdgeWalls() {
@@ -834,6 +870,15 @@ function initEvents() {
     syncFloorUI();
   });
 
+  document.getElementById('btn-save-json').addEventListener('click', saveToJSON);
+  document.getElementById('btn-load-json').addEventListener('click', function() {
+    document.getElementById('load-json-input').value = '';
+    document.getElementById('load-json-input').click();
+  });
+  document.getElementById('load-json-input').addEventListener('change', function(e) {
+    if (e.target.files && e.target.files[0]) loadFromJSON(e.target.files[0]);
+  });
+
   document.getElementById('btn-calc-raid').addEventListener('click', doRaidCalc);
 }
 
@@ -974,6 +1019,16 @@ function handlePlace(mx, my) {
     if (piece) state.tcPiece = { floor: state.currentFloor, id: piece.id };
     return;
   }
+  if (tool === 'loot') {
+    var piece = findPieceAt(w.wx, w.wy, state.currentFloor);
+    if (piece) piece.isLoot = !piece.isLoot;
+    return;
+  }
+  if (tool === 'hc') {
+    var piece = findPieceAt(w.wx, w.wy, state.currentFloor);
+    if (piece) piece.isHC = !piece.isHC;
+    return;
+  }
   if (tool === 'erase') {
     handleErase(mx, my);
     return;
@@ -1040,6 +1095,7 @@ function syncToolUI() {
     state._snapPreview = null;
     state._snapEdge = null;
   }
+  canvas.style.cursor = (t === 'loot' || t === 'tc' || t === 'hc') ? 'pointer' : 'crosshair';
   render();
 }
 
@@ -1051,11 +1107,12 @@ function syncFloorUI() {
 }
 
 function updateStats() {
-  var squares = 0, triangles = 0, doors = 0;
+  var squares = 0, triangles = 0, doors = 0, honeycomb = 0;
   state.floors.forEach(function(fl) {
     Object.values(fl.pieces).forEach(function(p) {
       if (p.shape === 'square') squares++;
       else triangles++;
+      if (p.isHC) honeycomb++;
     });
     Object.values(fl.walls).forEach(function(w) {
       if (w && w.doorType) doors++;
@@ -1067,6 +1124,7 @@ function updateStats() {
   document.getElementById('stat-triangles').textContent = triangles;
   document.getElementById('stat-area').textContent = (squares + triangles * 0.5).toFixed(1);
   document.getElementById('stat-doors').textContent = doors;
+  document.getElementById('stat-honeycomb').textContent = honeycomb;
   document.getElementById('stat-tc').textContent = state.tcPiece
     ? 'Floor ' + (state.tcPiece.floor + 1) + ' (piece #' + state.tcPiece.id + ')'
     : '\u2014';
@@ -1192,6 +1250,51 @@ function dijkstra(graph, start, end) {
     if (node === start) { path.unshift(start); break; }
   }
   return { cost: d[end], path: path };
+}
+
+/* ── SAVE / LOAD JSON ────────────────────────────────────────────────────── */
+
+function saveToJSON() {
+  var data = {
+    version: 1,
+    _nextId: _nextId,
+    tcPiece: state.tcPiece,
+    floors: state.floors
+  };
+  var json = JSON.stringify(data, null, 2);
+  var blob = new Blob([json], { type: 'application/json' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = 'rust-base.json';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function() { URL.revokeObjectURL(url); document.body.removeChild(a); }, 100);
+}
+
+function loadFromJSON(file) {
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      var data = JSON.parse(e.target.result);
+      if (!data || !Array.isArray(data.floors)) throw new Error('Invalid save file');
+      state.floors = data.floors;
+      state.tcPiece = data.tcPiece || null;
+      state.currentFloor = 0;
+      _nextId = data._nextId || 1;
+      // Ensure _nextId is always higher than any existing piece id
+      state.floors.forEach(function(fl) {
+        Object.keys(fl.pieces || {}).forEach(function(k) {
+          var id = parseInt(k, 10);
+          if (id >= _nextId) _nextId = id + 1;
+        });
+      });
+      syncFloorUI();
+    } catch (err) {
+      alert('Failed to load save file: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
 }
 
 /* ── INIT ─────────────────────────────────────────────────────────────────── */

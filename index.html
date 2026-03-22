@@ -38,6 +38,8 @@
           <button class="tool-btn" data-tool="triangle">◢ Triangle</button>
           <button class="tool-btn" data-tool="door">🚪 Door</button>
           <button class="tool-btn" data-tool="tc">📦 TC</button>
+          <button class="tool-btn" data-tool="loot">🟢 Loot</button>
+          <button class="tool-btn" data-tool="hc">🐝 HC</button>
           <button class="tool-btn" data-tool="erase">✕ Erase</button>
         </div>
 
@@ -76,6 +78,9 @@
         <h3>Actions</h3>
         <button class="action-btn" id="btn-clear-floor">🗑️ Clear Floor</button>
         <button class="action-btn danger" id="btn-clear-all">💥 Clear All</button>
+        <button class="action-btn" id="btn-save-json">💾 Save JSON</button>
+        <button class="action-btn" id="btn-load-json">📂 Load JSON</button>
+        <input type="file" id="load-json-input" accept=".json" style="display:none" />
       </section>
 
     </aside>
@@ -97,6 +102,7 @@
           <div class="stat-row"><span>Triangles</span><span id="stat-triangles">0</span></div>
           <div class="stat-row"><span>Total Area</span><span id="stat-area">0</span></div>
           <div class="stat-row"><span>Doors</span><span id="stat-doors">0</span></div>
+          <div class="stat-row"><span>Honeycomb</span><span id="stat-honeycomb">0</span></div>
           <div class="stat-row"><span>TC Room</span><span id="stat-tc">—</span></div>
         </div>
       </section>
